@@ -13,14 +13,13 @@ jobs:
           distribution: 'temurin'
           java-version: '17'
 
-      - name: Установка Android SDK и сборка APK
-        uses: android-actions/setup-android@v3
+      - name: Настройка Gradle и компиляция экспериментального APK
+        uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: '8.2'
 
-      - name: Компиляция экспериментального APK
-        run: |
-          gradle wrapper --gradle-version 8.2
-          chmod +x gradlew
-          ./gradlew assembleDebug
+      - name: Сборка APK
+        run: gradle assembleDebug --no-daemon
 
       - name: Выгрузка готового APK
         uses: actions/upload-artifact@v4
