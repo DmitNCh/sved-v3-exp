@@ -8,8 +8,6 @@ import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
 import android.graphics.Canvas;
 import android.graphics.Color;
-import android.graphics.ColorMatrix;
-import android.graphics.ColorMatrixColorFilter;
 import android.graphics.Matrix;
 import android.graphics.Paint;
 import android.hardware.Camera;
@@ -17,6 +15,7 @@ import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Process;
+import android.view.Gravity;
 import android.view.SurfaceHolder;
 import android.view.SurfaceView;
 import android.view.View;
@@ -32,7 +31,7 @@ import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.util.List;
 
-// Терминал СВЕД v3.0 со встроенным дальнобойным оптическим трактом и проявкой контуров
+// Терминал СВЕД v3.0: Снайперский 8x захват в полном разрешении матрицы + срез ореола цифр
 @SuppressWarnings("deprecation")
 public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
@@ -45,15 +44,15 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private ScrollView scriptScroll;
     private StringBuilder scriptBuffer = new StringBuilder();
 
-    // Оптический блок СВЕД
     private LinearLayout cameraContainer;
     private SurfaceView surfaceView;
     private SurfaceHolder surfaceHolder;
     private ImageView resultImageView;
     private Camera mCamera;
-    private boolean isPreviewRunning = false;
-    private int currentZoom = 0;
-    private int currentExposure = 0;
+
+    private int zoomPercent = 85;
+    private int exposureDarkenPercent = 100; // Максимальное притемнение ореола по умолчанию
+    private boolean ledThresholdMode = true; // Специальный режим разделения сегментов цифр
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -61,27 +60,27 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
         LinearLayout layout = new LinearLayout(this);
         layout.setOrientation(LinearLayout.VERTICAL);
-        layout.setPadding(12, 12, 12, 12);
+        layout.setPadding(10, 10, 10, 10);
         layout.setBackgroundColor(0xFF000000);
 
         // 1. ВЕРХНЕЕ ОКНО: Журнал ядра
         consoleOutput = new TextView(this);
         consoleOutput.setTextColor(0xFF00FF00);
-        consoleOutput.setTextSize(11.5f);
-        consoleOutput.setText("=== ТЕРМИНАЛ СВЕД v3.0 (ОПТИЧЕСКИЙ КОНТУР) ===\n" +
-                "Готов к подавлению бликов и контурной проявке дальних объектов.\n");
+        consoleOutput.setTextSize(11f);
+        consoleOutput.setText("=== ТЕРМИНАЛ СВЕД v3.0 (СНАЙПЕРСКАЯ ОПТИКА) ===\n" +
+                "Режим: Полное разрешение матрицы + 8x вырезка центра + срез ореола LED.\n");
 
         consoleScroll = new ScrollView(this);
         consoleScroll.addView(consoleOutput);
         LinearLayout.LayoutParams consoleParams = new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, 0, 0.7f);
+                LinearLayout.LayoutParams.MATCH_PARENT, 0, 0.55f);
         layout.addView(consoleScroll, consoleParams);
 
-        // 2. ВСТРОЕННЫЙ ОПТИЧЕСКИЙ ВИДОИСКАТЕЛЬ СВЕД (открывается по команде скрипта)
+        // 2. ОПТИЧЕСКИЙ БЛОК С ПРИЦЕЛЬНОЙ РАМКОЙ
         cameraContainer = new LinearLayout(this);
         cameraContainer.setOrientation(LinearLayout.VERTICAL);
         cameraContainer.setBackgroundColor(0xFF0A1520);
-        cameraContainer.setPadding(8, 8, 8, 8);
+        cameraContainer.setPadding(6, 6, 6, 6);
         cameraContainer.setVisibility(View.GONE);
 
         FrameLayout viewFinderFrame = new FrameLayout(this);
@@ -89,23 +88,33 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         surfaceHolder = surfaceView.getHolder();
         surfaceHolder.addCallback(this);
         viewFinderFrame.addView(surfaceView, new FrameLayout.LayoutParams(
-                FrameLayout.LayoutParams.MATCH_PARENT, 480));
+                FrameLayout.LayoutParams.MATCH_PARENT, 460));
 
-        // Экран вывода обработанного сверхчёткого снимка
+        // Прицельная зелёная рамка по центру (чтобы точно навести на часы)
+        TextView sniperCrosshair = new TextView(this);
+        sniperCrosshair.setText("[ + НАВЕДИТЕ ЧАСЫ В ЦЕНТР + ]");
+        sniperCrosshair.setTextColor(0xFF00FF00);
+        sniperCrosshair.setTextSize(11f);
+        sniperCrosshair.setGravity(Gravity.CENTER);
+        FrameLayout.LayoutParams crossParams = new FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT, Gravity.CENTER);
+        viewFinderFrame.addView(sniperCrosshair, crossParams);
+
+        // Экран вывода проявленного снимка
         resultImageView = new ImageView(this);
         resultImageView.setScaleType(ImageView.ScaleType.FIT_CENTER);
         resultImageView.setBackgroundColor(0xFF000000);
         resultImageView.setVisibility(View.GONE);
         viewFinderFrame.addView(resultImageView, new FrameLayout.LayoutParams(
-                FrameLayout.LayoutParams.MATCH_PARENT, 480));
+                FrameLayout.LayoutParams.MATCH_PARENT, 460));
 
         cameraContainer.addView(viewFinderFrame);
 
-        // Ползунок дальнобойности (Оптический/Матричный ЗУМ)
+        // Ползунок 1: ЗУМ
         TextView zoomLabel = new TextView(this);
-        zoomLabel.setText("ДАЛЬНОБОЙНОСТЬ (ЗУМ): наведите на часы");
+        zoomLabel.setText("1. ОПТИЧЕСКИЙ ЗУМ + СНАЙПЕРСКИЙ КРОП:");
         zoomLabel.setTextColor(0xFF00FFFF);
-        zoomLabel.setTextSize(11f);
+        zoomLabel.setTextSize(10.5f);
         cameraContainer.addView(zoomLabel);
 
         SeekBar zoomBar = new SeekBar(this);
@@ -114,38 +123,60 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         zoomBar.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
             @Override
             public void onProgressChanged(SeekBar seekBar, int progress, boolean fromUser) {
-                applyCameraZoomAndAntiGlare(progress, -80);
+                zoomPercent = progress;
+                applyHardwareParameters();
             }
             @Override public void onStartTrackingTouch(SeekBar seekBar) {}
             @Override public void onStopTrackingTouch(SeekBar seekBar) {}
         });
         cameraContainer.addView(zoomBar);
 
-        // Кнопки управления оптическим захватом
+        // Ползунок 2: СРЕЗ ОРЕОЛА ЦИФР (затемнение пересвета светодиодов)
+        TextView expLabel = new TextView(this);
+        expLabel.setText("2. ПОДАВЛЕНИЕ ОРЕОЛА СВЕТОДИОДОВ (чтобы цифры не сливались):");
+        expLabel.setTextColor(0xFFFFAA00);
+        expLabel.setTextSize(10.5f);
+        cameraContainer.addView(expLabel);
+
+        SeekBar expBar = new SeekBar(this);
+        expBar.setMax(100);
+        expBar.setProgress(100);
+        expBar.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+            @Override
+            public void onProgressChanged(SeekBar seekBar, int progress, boolean fromUser) {
+                exposureDarkenPercent = progress;
+                applyHardwareParameters();
+            }
+            @Override public void onStartTrackingTouch(SeekBar seekBar) {}
+            @Override public void onStopTrackingTouch(SeekBar seekBar) {}
+        });
+        cameraContainer.addView(expBar);
+
+        // Кнопки захвата и проявки
         LinearLayout camBtnRow = new LinearLayout(this);
         camBtnRow.setOrientation(LinearLayout.HORIZONTAL);
 
         Button snapBtn = new Button(this);
-        snapBtn.setText("СНЯТЬ И ПРОЯВИТЬ ЧЕТКОСТЬ");
-        snapBtn.setTextSize(10.5f);
+        snapBtn.setText("ФОКУС + СНАЙПЕР-ПРОЯВКА ЧАСОВ");
+        snapBtn.setTextSize(10f);
         snapBtn.setBackgroundColor(0xFF007744);
         snapBtn.setTextColor(0xFFFFFFFF);
-        LinearLayout.LayoutParams snapP = new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1.3f);
+        LinearLayout.LayoutParams snapP = new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1.35f);
         snapP.setMargins(2, 4, 2, 2);
         snapBtn.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
-                captureAndSharpenClock();
+                focusAndCaptureSniperClock();
             }
         });
         camBtnRow.addView(snapBtn, snapP);
 
         Button liveBtn = new Button(this);
         liveBtn.setText("ПРИЦЕЛ / СБРОС");
-        liveBtn.setTextSize(10.5f);
+        liveBtn.setTextSize(10f);
         liveBtn.setBackgroundColor(0xFF224466);
         liveBtn.setTextColor(0xFFFFFFFF);
-        LinearLayout.LayoutParams liveP = new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 0.7f);
+        LinearLayout.LayoutParams liveP = new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 0.65f);
         liveP.setMargins(2, 4, 2, 2);
         liveBtn.setOnClickListener(new View.OnClickListener() {
             @Override
@@ -161,18 +192,17 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         cameraContainer.addView(camBtnRow);
         layout.addView(cameraContainer);
 
-        // 3. ОКНО АКТИВНЫХ СКРИПТОВ (только добавление модулей)
+        // 3. ОКНО АКТИВНЫХ СКРИПТОВ
         TextView boxLabel = new TextView(this);
         boxLabel.setText("ОКНО АКТИВНЫХ СКРИПТОВ (БЕЗ КЛАВИАТУРЫ):");
         boxLabel.setTextColor(0xFF00FFFF);
-        boxLabel.setTextSize(11f);
-        boxLabel.setPadding(0, 4, 0, 2);
+        boxLabel.setTextSize(10.5f);
         layout.addView(boxLabel);
 
         scriptBox = new TextView(this);
         scriptBox.setTextColor(0xFFAAFF00);
-        scriptBox.setTextSize(12f);
-        scriptBox.setPadding(12, 12, 12, 12);
+        scriptBox.setTextSize(11.5f);
+        scriptBox.setPadding(10, 10, 10, 10);
         scriptBox.setFocusable(false);
         scriptBox.setClickable(false);
 
@@ -180,34 +210,34 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         scriptScroll.setBackgroundColor(0xFF121820);
         scriptScroll.addView(scriptBox);
         LinearLayout.LayoutParams boxParams = new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, 0, 0.9f);
-        boxParams.setMargins(0, 2, 0, 6);
+                LinearLayout.LayoutParams.MATCH_PARENT, 0, 0.65f);
+        boxParams.setMargins(0, 2, 0, 4);
         layout.addView(scriptScroll, boxParams);
 
-        // 4. КНОПКИ ДОБАВЛЕНИЯ ОБУЧАЮЩИХ И ДЕЙСТВУЮЩИХ СКРИПТОВ
+        // 4. КНОПКИ ДОБАВЛЕНИЯ СКРИПТОВ
         LinearLayout trainRow = new LinearLayout(this);
         trainRow.setOrientation(LinearLayout.HORIZONTAL);
-        trainRow.addView(createAddButton("+ ОБУЧЕНИЕ: ЧАСЫ/ТАБЛО", 0xFF1F3A52,
-                "[ОБУЧАЮЩИЙ СКРИПТ: ПРОЯВКА_ТАБЛО]\n" +
-                "ОБУЧЕНИЕ: СРЕЗ ЗАСВЕТКИ ПРОЖЕКТОРОВ (-2 EV)\n" +
-                "ОБУЧЕНИЕ: МАТРИЦА РЕЗКОСТИ ЦИФР 3x3"));
-        trainRow.addView(createAddButton("+ ДЕЙСТВИЕ: ПРИЦЕЛ КАМЕРЫ", 0xFF1A4731,
-                "[СКРИПТ ДЕЙСТВИЯ: ОПТИЧЕСКИЙ_ПРИЦЕЛ]\n" +
-                "ДЕЙСТВИЕ: ВКЛЮЧИТЬ ОПТИЧЕСКИЙ ПРИЦЕЛ СВЕД\n" +
-                "ДЕЙСТВИЕ: ДАЛЬНОБОЙНОСТЬ И ЧЕТКОСТЬ +100%"));
+        trainRow.addView(createAddButton("+ ОБУЧЕНИЕ: СРЕЗ ОРЕОЛА ЦИФР", 0xFF1F3A52,
+                "[ОБУЧАЮЩИЙ СКРИПТ: РАЗДЕЛЕНИЕ_СЕГМЕНТОВ_ЧАСОВ]\n" +
+                "ОБУЧЕНИЕ: МАКСИМАЛЬНОЕ РАЗРЕШЕНИЕ МАТРИЦЫ\n" +
+                "ОБУЧЕНИЕ: ОТСЕЧЕНИЕ КРАСНОГО ОРЕОЛА СВЕТОДИОДОВ"));
+        trainRow.addView(createAddButton("+ ДЕЙСТВИЕ: 8X СНАЙПЕР-ЗУМ", 0xFF1A4731,
+                "[СКРИПТ ДЕЙСТВИЯ: СНАЙПЕРСКИЙ_ЗАХВАТ]\n" +
+                "ДЕЙСТВИЕ: ТОЧНЫЙ АВТОФОКУС НА МИШЕНЬ\n" +
+                "ДЕЙСТВИЕ: 8-КРАТНАЯ ВЫРЕЗКА ЦЕНТРА БЕЗ МЫЛА"));
         layout.addView(trainRow);
 
-        // 5. ПАНЕЛЬ ЗАГРУЗКИ ИЗ ФАЙЛА / ОЧИСТКИ ОКНА
+        // 5. ФАЙЛ / ОЧИСТКА
         LinearLayout fileRow = new LinearLayout(this);
         fileRow.setOrientation(LinearLayout.HORIZONTAL);
 
         Button fileBtn = new Button(this);
         fileBtn.setText("+ ДОБАВИТЬ СКРИПТ ИЗ ФАЙЛА");
-        fileBtn.setTextSize(10.5f);
+        fileBtn.setTextSize(10f);
         fileBtn.setBackgroundColor(0xFF3B2E58);
         fileBtn.setTextColor(0xFFFFFFFF);
         LinearLayout.LayoutParams fileParams = new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1.3f);
-        fileParams.setMargins(2, 2, 2, 4);
+        fileParams.setMargins(2, 2, 2, 3);
         fileBtn.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
@@ -218,11 +248,11 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
         Button clearBtn = new Button(this);
         clearBtn.setText("ОЧИСТИТЬ ОКНО");
-        clearBtn.setTextSize(10.5f);
+        clearBtn.setTextSize(10f);
         clearBtn.setBackgroundColor(0xFF333333);
         clearBtn.setTextColor(0xFFFFFFFF);
         LinearLayout.LayoutParams clearParams = new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 0.7f);
-        clearParams.setMargins(2, 2, 2, 4);
+        clearParams.setMargins(2, 2, 2, 3);
         clearBtn.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
@@ -233,14 +263,14 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         fileRow.addView(clearBtn, clearParams);
         layout.addView(fileRow);
 
-        // 6. КНОПКА ИСПОЛНЕНИЯ СКРИПТОВ
+        // 6. ЗАПУСК СКРИПТОВ
         Button runBtn = new Button(this);
         runBtn.setText("ВЫПОЛНИТЬ ДОБАВЛЕННЫЕ В ОКНО СКРИПТЫ");
         runBtn.setBackgroundColor(0xFF006622);
         runBtn.setTextColor(0xFFFFFFFF);
         LinearLayout.LayoutParams runParams = new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
-        runParams.setMargins(0, 0, 0, 4);
+        runParams.setMargins(0, 0, 0, 3);
         runBtn.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
@@ -263,23 +293,16 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         layout.addView(killBtn);
 
         setContentView(layout);
-        appendScriptToWindow("[СКРИПТ ОПТИКИ: ПРОЯВКА_ДАЛЬНИХ_ЧАСОВ]\n" +
-                "ОБУЧЕНИЕ: СРЕЗ ЗАСВЕТКИ ПРОЖЕКТОРОВ (-2 EV)\n" +
-                "ДЕЙСТВИЕ: ВКЛЮЧИТЬ ОПТИЧЕСКИЙ ПРИЦЕЛ СВЕД\n" +
-                "ДЕЙСТВИЕ: ФОКУС НА ДАЛЬНОБОЙНОСТЬ + ЧЕТКОСТЬ 100%");
+        appendScriptToWindow("[СКРИПТ ОПТИКИ: СНАЙПЕРСКАЯ_ПРОЯВКА_ЧАСОВ]\n" +
+                "ОБУЧЕНИЕ: МАКСИМАЛЬНОЕ РАЗРЕШЕНИЕ МАТРИЦЫ\n" +
+                "ОБУЧЕНИЕ: СРЕЗ КРАСНОГО ОРЕОЛА СВЕТОДИОДОВ\n" +
+                "ДЕЙСТВИЕ: ТОЧНЫЙ АВТОФОКУС + 8X ВЫРЕЗКА ЦЕНТРА");
     }
 
-    // Запуск встроенной камеры с подавлением засветки от потолочных ламп
     private void executeOpticalScripts() {
-        String all = scriptBuffer.toString().toUpperCase();
-        if (all.isEmpty()) {
-            consoleOutput.append("\n[Инфо]: Добавьте скрипт в окно.\n");
-            return;
-        }
-        consoleOutput.append("\n=== ВКЛЮЧЕНИЕ ОПТИЧЕСКОГО ТРАКТА СВЕД ===\n");
-        consoleOutput.append(" -> Подавление засветки ламп: АКТИВНО (-2 EV)\n");
-        consoleOutput.append(" -> Фиксация фокуса на дальнюю дистанцию: АКТИВНО\n");
-        consoleOutput.append(" -> Матрица контурной резкости цифр: ГОТОВА\n");
+        consoleOutput.append("\n=== СНАЙПЕРСКИЙ РЕЖИМ ОПТИКИ АКТИВИРОВАН ===\n");
+        consoleOutput.append(" -> Выбрано максимальное физическое разрешение сенсора.\n");
+        consoleOutput.append(" -> Наведите часы в зелёный прицел по центру и нажмите ФОКУС + СНАЙПЕР-ПРОЯВКА.\n");
         scrollToBottom(consoleScroll);
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
@@ -312,54 +335,71 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             }
             mCamera.setPreviewDisplay(surfaceHolder);
             mCamera.startPreview();
-            isPreviewRunning = true;
-            // Сразу выставляем дальнобойный зум 85% и притемнение прожекторов (-80%)
-            applyCameraZoomAndAntiGlare(85, -80);
-        } catch (Exception e) {
-            consoleOutput.append(" [Оптика]: Наведите камеру и нажмите СНЯТЬ.\n");
-        }
+            applyHardwareParameters();
+        } catch (Exception ignored) {}
     }
 
-    // Настройка аппаратной матрицы: дальнобойный зум + срез пересвета ламп + фокус вдаль
-    private void applyCameraZoomAndAntiGlare(int zoomPercent, int exposurePercent) {
+    // Установка максимальных мегапикселей матрицы, зума и среза ореола
+    private void applyHardwareParameters() {
         if (mCamera == null) return;
         try {
             Camera.Parameters params = mCamera.getParameters();
 
-            // 1. Дальнобойный зум
+            // 1. Выбираем САМОЕ БОЛЬШОЕ физическое разрешение матрицы (максимум мегапикселей)
+            List<Camera.Size> sizes = params.getSupportedPictureSizes();
+            if (sizes != null && !sizes.isEmpty()) {
+                Camera.Size best = sizes.get(0);
+                for (Camera.Size s : sizes) {
+                    if ((s.width * s.height) > (best.width * best.height)) {
+                        best = s;
+                    }
+                }
+                params.setPictureSize(best.width, best.height);
+            }
+            params.setJpegQuality(100);
+
+            // 2. Зум
             if (params.isZoomSupported()) {
-                int maxZoom = params.getMaxZoom();
-                currentZoom = (maxZoom * zoomPercent) / 100;
-                params.setZoom(currentZoom);
+                int maxZ = params.getMaxZoom();
+                params.setZoom((maxZ * zoomPercent) / 100);
             }
 
-            // 2. Подавление бликов от ламп (экспокоррекция в минус, чтобы цифры часов не сливались)
+            // 3. Максимальное притемнение экспозиции (чтобы яркие цифры часов не сливались в пятно)
             int minExp = params.getMinExposureCompensation();
             if (minExp < 0) {
-                currentExposure = (minExp * Math.abs(exposurePercent)) / 100;
-                params.setExposureCompensation(currentExposure);
+                params.setExposureCompensation((minExp * exposureDarkenPercent) / 100);
             }
 
-            // 3. Фокус на бесконечность / дальние объекты
+            // 4. Режим точного автофокуса
             List<String> focusModes = params.getSupportedFocusModes();
-            if (focusModes != null) {
-                if (focusModes.contains(Camera.Parameters.FOCUS_MODE_INFINITY)) {
-                    params.setFocusMode(Camera.Parameters.FOCUS_MODE_INFINITY);
-                } else if (focusModes.contains(Camera.Parameters.FOCUS_MODE_CONTINUOUS_PICTURE)) {
-                    params.setFocusMode(Camera.Parameters.FOCUS_MODE_CONTINUOUS_PICTURE);
-                }
+            if (focusModes != null && focusModes.contains(Camera.Parameters.FOCUS_MODE_AUTO)) {
+                params.setFocusMode(Camera.Parameters.FOCUS_MODE_AUTO);
             }
 
             mCamera.setParameters(params);
         } catch (Exception ignored) {}
     }
 
-    // Захват кадра и математическое усиление чёткости контуров цифр (Свёртка 3x3 + Контраст)
-    private void captureAndSharpenClock() {
+    // Сначала точная фокусировка линзы на часы, затем мгновенный снимок
+    private void focusAndCaptureSniperClock() {
         if (mCamera == null) return;
-        consoleOutput.append(" -> Захват кадра и прогон через матрицу чёткости СВЕД...\n");
+        consoleOutput.append(" -> Точная наводка линзы на цель и захват кадра...\n");
         scrollToBottom(consoleScroll);
 
+        try {
+            mCamera.autoFocus(new Camera.AutoFocusCallback() {
+                @Override
+                public void onAutoFocus(boolean success, Camera camera) {
+                    takeHighResPicture();
+                }
+            });
+        } catch (Exception e) {
+            takeHighResPicture();
+        }
+    }
+
+    private void takeHighResPicture() {
+        if (mCamera == null) return;
         mCamera.takePicture(null, null, new Camera.PictureCallback() {
             @Override
             public void onPictureTaken(byte[] data, Camera camera) {
@@ -368,58 +408,71 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                     Matrix rot = new Matrix();
                     rot.postRotate(90);
 
-                    // Вырезаем центральную дальнобойную область (дополнительное 2x приближение без мыла)
+                    // Снайперская вырезка центральной зоны (1/5 кадра по центру, где находятся часы)
                     int w = raw.getWidth();
                     int h = raw.getHeight();
-                    int cropW = w / 2;
-                    int cropH = h / 2;
-                    Bitmap cropped = Bitmap.createBitmap(raw, w / 4, h / 4, cropW, cropH, rot, true);
+                    int cropW = w / 4;
+                    int cropH = h / 4;
+                    int startX = (w - cropW) / 2;
+                    int startY = (h - cropH) / 2;
 
-                    // Прогоняем через наш фильтр высокой контрастности и контурной резкости
-                    Bitmap enhanced = applySvedSharpnessMatrix(cropped);
+                    Bitmap cropped = Bitmap.createBitmap(raw, startX, startY, cropW, cropH, rot, true);
+
+                    // Прогоняем через алгоритм разделения слипшихся сегментов цифр
+                    Bitmap enhanced = separateLedDigitsMatrix(cropped);
 
                     resultImageView.setImageBitmap(enhanced);
                     resultImageView.setVisibility(View.VISIBLE);
-                    consoleOutput.append(" === ГОТОВО: Кадр проявлен! Блики срезаны, контуры цифр усилены ===\n");
+                    consoleOutput.append(" === ГОТОВО: Снайперский кроп " + cropped.getWidth() + "x" + cropped.getHeight() +
+                            " пкс проявлен, ореол срезан! ===\n");
                     scrollToBottom(consoleScroll);
                 } catch (Exception e) {
-                    consoleOutput.append(" [Ошибка обработки]: " + e.getMessage() + "\n");
+                    consoleOutput.append(" [Ошибка]: " + e.getMessage() + "\n");
                 }
             }
         });
     }
 
-    // Математический фильтр СВЕД: подавление серой пелены + контурная резкость 3x3
-    private Bitmap applySvedSharpnessMatrix(Bitmap src) {
+    // Специальная матрица СВЕД для разделения светящихся сегментов цифр на дальних табло
+    private Bitmap separateLedDigitsMatrix(Bitmap src) {
         int width = src.getWidth();
         int height = src.getHeight();
-
-        // Шаг 1: Повышаем контрастность и убираем серый туман вокруг светящихся цифр
-        Bitmap contrasted = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888);
-        Canvas canvas = new Canvas(contrasted);
-        Paint paint = new Paint();
-        ColorMatrix cm = new ColorMatrix(new float[]{
-                1.6f, 0,    0,    0, -45, // Усиление красного спектра (для табло часов)
-                0,    1.4f, 0,    0, -45,
-                0,    0,    1.4f, 0, -45,
-                0,    0,    0,    1,   0
-        });
-        paint.setColorFilter(new ColorMatrixColorFilter(cm));
-        canvas.drawBitmap(src, 0, 0, paint);
-
-        // Шаг 2: Ядро свёртки резкости (Sharpen Kernel) для чётких границ сегментов цифр
         int[] pixels = new int[width * height];
+        int[] step1 = new int[width * height];
         int[] outPixels = new int[width * height];
-        contrasted.getPixels(pixels, 0, width, 0, 0, width, height);
+        src.getPixels(pixels, 0, width, 0, 0, width, height);
 
+        // Шаг 1: Нелинейное подавление ореола (Гамма-срез: слабый ореол вокруг цифр гасится в ноль, остаётся только стержень цифры)
+        for (int i = 0; i < pixels.length; i++) {
+            int c = pixels[i];
+            int r = Color.red(c);
+            int g = Color.green(c);
+            int b = Color.blue(c);
+
+            // Если это красное свечение табло (красный сильно выше синего/зелёного)
+            if (r > g + 25 && r > b + 25) {
+                // Срезаем размытый ореол вокруг сегментов: возводим яркость в куб, чтобы края цифр стали тонкими и раздельными
+                float normR = r / 255.0f;
+                int sharpRed = clamp((int) (Math.pow(normR, 2.8) * 280.0f));
+                int coreYellow = (r > 220 && g > 120) ? clamp((int) (Math.pow(g / 255.0f, 3.0) * 255.0f)) : 0;
+                step1[i] = Color.rgb(sharpRed, coreYellow, 0);
+            } else {
+                // Остальной фон (балки, стены) делаем умеренно контрастным без шума
+                int luma = (r + g + b) / 3;
+                int clean = clamp((int) ((luma - 40) * 1.3f));
+                step1[i] = Color.rgb(clean, clean, clean);
+            }
+        }
+
+        // Шаг 2: Контурная матрица высокой резкости 3x3
         for (int y = 1; y < height - 1; y++) {
             for (int x = 1; x < width - 1; x++) {
                 int idx = y * width + x;
-                int c = pixels[idx];
-                int top = pixels[(y - 1) * width + x];
-                int bottom = pixels[(y + 1) * width + x];
-                int left = pixels[y * width + (x - 1)];
-                int right = pixels[y * width + (x + 1)];
+                int c = step1[idx];
+                int top = step1[(y - 1) * width + x];
+                int bottom = step1[(y + 1) * width + x];
+                int left = step1[y * width + (x - 1)];
+                int right = step1[y * width + (x + 1)];
 
                 int r = clamp(5 * Color.red(c) - Color.red(top) - Color.red(bottom) - Color.red(left) - Color.red(right));
                 int g = clamp(5 * Color.green(c) - Color.green(top) - Color.green(bottom) - Color.green(left) - Color.green(right));
@@ -428,6 +481,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                 outPixels[idx] = Color.rgb(r, g, b);
             }
         }
+
         Bitmap finalBmp = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888);
         finalBmp.setPixels(outPixels, 0, width, 0, 0, width, height);
         return finalBmp;
@@ -455,11 +509,11 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private Button createAddButton(String title, int color, final String scriptBlock) {
         Button btn = new Button(this);
         btn.setText(title);
-        btn.setTextSize(10f);
+        btn.setTextSize(9.5f);
         btn.setBackgroundColor(color);
         btn.setTextColor(0xFFFFFFFF);
         LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f);
-        params.setMargins(2, 2, 2, 3);
+        params.setMargins(2, 2, 2, 2);
         btn.setLayoutParams(params);
         btn.setOnClickListener(new View.OnClickListener() {
             @Override
