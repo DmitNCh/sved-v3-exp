@@ -6,16 +6,16 @@ import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
-import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.Matrix;
-import android.graphics.Paint;
+import android.graphics.Rect;
 import android.hardware.Camera;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Process;
 import android.view.Gravity;
+import android.view.MotionEvent;
 import android.view.SurfaceHolder;
 import android.view.SurfaceView;
 import android.view.View;
@@ -29,9 +29,10 @@ import android.widget.TextView;
 import java.io.BufferedReader;
 import java.io.InputStream;
 import java.io.InputStreamReader;
+import java.util.ArrayList;
 import java.util.List;
 
-// Терминал СВЕД v3.0: Снайперский 8x захват в полном разрешении матрицы + срез ореола цифр
+// Терминал СВЕД v3.0: Прямой попиксельный захват 1:1 (без системного мыла зума) + Авто-Лупа на красное табло часов
 @SuppressWarnings("deprecation")
 public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
@@ -50,9 +51,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private ImageView resultImageView;
     private Camera mCamera;
 
-    private int zoomPercent = 85;
-    private int exposureDarkenPercent = 100; // Максимальное притемнение ореола по умолчанию
-    private boolean ledThresholdMode = true; // Специальный режим разделения сегментов цифр
+    private int cropPowerPercent = 80; // Чистый попиксельный кроп СВЕД вместо мыльного зума
+    private int redCutoffThreshold = 65; // Порог отсечения ореола между цифрами
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -67,16 +67,16 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         consoleOutput = new TextView(this);
         consoleOutput.setTextColor(0xFF00FF00);
         consoleOutput.setTextSize(11f);
-        consoleOutput.setText("=== ТЕРМИНАЛ СВЕД v3.0 (СНАЙПЕРСКАЯ ОПТИКА) ===\n" +
-                "Режим: Полное разрешение матрицы + 8x вырезка центра + срез ореола LED.\n");
+        consoleOutput.setText("=== ТЕРМИНАЛ СВЕД v3.0 (ПРЯМАЯ МАТРИЦА 1:1) ===\n" +
+                "Системный мыльный зум ОТКЛЮЧЕН. Работает прямой съём пикселей + Авто-Лупа табло.\n");
 
         consoleScroll = new ScrollView(this);
         consoleScroll.addView(consoleOutput);
         LinearLayout.LayoutParams consoleParams = new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, 0, 0.55f);
+                LinearLayout.LayoutParams.MATCH_PARENT, 0, 0.5f);
         layout.addView(consoleScroll, consoleParams);
 
-        // 2. ОПТИЧЕСКИЙ БЛОК С ПРИЦЕЛЬНОЙ РАМКОЙ
+        // 2. ОПТИЧЕСКИЙ БЛОК
         cameraContainer = new LinearLayout(this);
         cameraContainer.setOrientation(LinearLayout.VERTICAL);
         cameraContainer.setBackgroundColor(0xFF0A1520);
@@ -87,96 +87,121 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         surfaceView = new SurfaceView(this);
         surfaceHolder = surfaceView.getHolder();
         surfaceHolder.addCallback(this);
-        viewFinderFrame.addView(surfaceView, new FrameLayout.LayoutParams(
-                FrameLayout.LayoutParams.MATCH_PARENT, 460));
 
-        // Прицельная зелёная рамка по центру (чтобы точно навести на часы)
+        // Нажатие пальцем прямо по видоискателю заставляет линзу сфокусироваться в точку!
+        surfaceView.setOnTouchListener(new View.OnTouchListener() {
+            @Override
+            public boolean onTouch(View v, MotionEvent event) {
+                if (event.getAction() == MotionEvent.ACTION_DOWN) {
+                    triggerExactCenterFocus();
+                }
+                return true;
+            }
+        });
+
+        viewFinderFrame.addView(surfaceView, new FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT, 450));
+
+        // Прицельная рамка
         TextView sniperCrosshair = new TextView(this);
-        sniperCrosshair.setText("[ + НАВЕДИТЕ ЧАСЫ В ЦЕНТР + ]");
+        sniperCrosshair.setText("[ + ДЕРЖИТЕ ЧАСЫ В ЦЕНТРЕ И НАЖМИТЕ СЮДА ДЛЯ ФОКУСА + ]");
         sniperCrosshair.setTextColor(0xFF00FF00);
-        sniperCrosshair.setTextSize(11f);
+        sniperCrosshair.setTextSize(10f);
         sniperCrosshair.setGravity(Gravity.CENTER);
         FrameLayout.LayoutParams crossParams = new FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT, Gravity.CENTER);
         viewFinderFrame.addView(sniperCrosshair, crossParams);
 
-        // Экран вывода проявленного снимка
+        // Экран вывода проявленного табло
         resultImageView = new ImageView(this);
         resultImageView.setScaleType(ImageView.ScaleType.FIT_CENTER);
         resultImageView.setBackgroundColor(0xFF000000);
         resultImageView.setVisibility(View.GONE);
         viewFinderFrame.addView(resultImageView, new FrameLayout.LayoutParams(
-                FrameLayout.LayoutParams.MATCH_PARENT, 460));
+                FrameLayout.LayoutParams.MATCH_PARENT, 450));
 
         cameraContainer.addView(viewFinderFrame);
 
-        // Ползунок 1: ЗУМ
+        // Ползунок 1: Масштаб вырезки табло (без потери резкости линзы)
         TextView zoomLabel = new TextView(this);
-        zoomLabel.setText("1. ОПТИЧЕСКИЙ ЗУМ + СНАЙПЕРСКИЙ КРОП:");
+        zoomLabel.setText("1. УВЕЛИЧЕНИЕ ТАБЛО ЧАСОВ (Чистый кроп матрицы без мыла):");
         zoomLabel.setTextColor(0xFF00FFFF);
-        zoomLabel.setTextSize(10.5f);
+        zoomLabel.setTextSize(10f);
         cameraContainer.addView(zoomLabel);
 
         SeekBar zoomBar = new SeekBar(this);
         zoomBar.setMax(100);
-        zoomBar.setProgress(85);
+        zoomBar.setProgress(80);
         zoomBar.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
             @Override
             public void onProgressChanged(SeekBar seekBar, int progress, boolean fromUser) {
-                zoomPercent = progress;
-                applyHardwareParameters();
+                cropPowerPercent = Math.max(20, progress);
             }
             @Override public void onStartTrackingTouch(SeekBar seekBar) {}
             @Override public void onStopTrackingTouch(SeekBar seekBar) {}
         });
         cameraContainer.addView(zoomBar);
 
-        // Ползунок 2: СРЕЗ ОРЕОЛА ЦИФР (затемнение пересвета светодиодов)
+        // Ползунок 2: Разделение палочек цифр (порог отсечения красного ореола)
         TextView expLabel = new TextView(this);
-        expLabel.setText("2. ПОДАВЛЕНИЕ ОРЕОЛА СВЕТОДИОДОВ (чтобы цифры не сливались):");
+        expLabel.setText("2. РАЗДЕЛЕНИЕ ПАЛОЧЕК ЦИФР (Срез красного пятна):");
         expLabel.setTextColor(0xFFFFAA00);
-        expLabel.setTextSize(10.5f);
+        expLabel.setTextSize(10f);
         cameraContainer.addView(expLabel);
 
         SeekBar expBar = new SeekBar(this);
         expBar.setMax(100);
-        expBar.setProgress(100);
+        expBar.setProgress(65);
         expBar.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
             @Override
             public void onProgressChanged(SeekBar seekBar, int progress, boolean fromUser) {
-                exposureDarkenPercent = progress;
-                applyHardwareParameters();
+                redCutoffThreshold = progress;
             }
             @Override public void onStartTrackingTouch(SeekBar seekBar) {}
             @Override public void onStopTrackingTouch(SeekBar seekBar) {}
         });
         cameraContainer.addView(expBar);
 
-        // Кнопки захвата и проявки
+        // Кнопки управления оптикой
         LinearLayout camBtnRow = new LinearLayout(this);
         camBtnRow.setOrientation(LinearLayout.HORIZONTAL);
 
+        Button focusBtn = new Button(this);
+        focusBtn.setText("1. НАВЕСТИ РЕЗКОСТЬ");
+        focusBtn.setTextSize(9.5f);
+        focusBtn.setBackgroundColor(0xFF554400);
+        focusBtn.setTextColor(0xFFFFFFFF);
+        LinearLayout.LayoutParams focP = new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 0.85f);
+        focP.setMargins(2, 4, 2, 2);
+        focusBtn.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                triggerExactCenterFocus();
+            }
+        });
+        camBtnRow.addView(focusBtn, focP);
+
         Button snapBtn = new Button(this);
-        snapBtn.setText("ФОКУС + СНАЙПЕР-ПРОЯВКА ЧАСОВ");
-        snapBtn.setTextSize(10f);
+        snapBtn.setText("2. ВЫДЕЛИТЬ ЧАСЫ");
+        snapBtn.setTextSize(9.5f);
         snapBtn.setBackgroundColor(0xFF007744);
         snapBtn.setTextColor(0xFFFFFFFF);
-        LinearLayout.LayoutParams snapP = new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1.35f);
+        LinearLayout.LayoutParams snapP = new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 0.95f);
         snapP.setMargins(2, 4, 2, 2);
         snapBtn.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
-                focusAndCaptureSniperClock();
+                takePureMatrixPicture();
             }
         });
         camBtnRow.addView(snapBtn, snapP);
 
         Button liveBtn = new Button(this);
-        liveBtn.setText("ПРИЦЕЛ / СБРОС");
-        liveBtn.setTextSize(10f);
+        liveBtn.setText("СБРОС");
+        liveBtn.setTextSize(9.5f);
         liveBtn.setBackgroundColor(0xFF224466);
         liveBtn.setTextColor(0xFFFFFFFF);
-        LinearLayout.LayoutParams liveP = new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 0.65f);
+        LinearLayout.LayoutParams liveP = new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 0.5f);
         liveP.setMargins(2, 4, 2, 2);
         liveBtn.setOnClickListener(new View.OnClickListener() {
             @Override
@@ -210,21 +235,21 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         scriptScroll.setBackgroundColor(0xFF121820);
         scriptScroll.addView(scriptBox);
         LinearLayout.LayoutParams boxParams = new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, 0, 0.65f);
+                LinearLayout.LayoutParams.MATCH_PARENT, 0, 0.6f);
         boxParams.setMargins(0, 2, 0, 4);
         layout.addView(scriptScroll, boxParams);
 
         // 4. КНОПКИ ДОБАВЛЕНИЯ СКРИПТОВ
         LinearLayout trainRow = new LinearLayout(this);
         trainRow.setOrientation(LinearLayout.HORIZONTAL);
-        trainRow.addView(createAddButton("+ ОБУЧЕНИЕ: СРЕЗ ОРЕОЛА ЦИФР", 0xFF1F3A52,
-                "[ОБУЧАЮЩИЙ СКРИПТ: РАЗДЕЛЕНИЕ_СЕГМЕНТОВ_ЧАСОВ]\n" +
-                "ОБУЧЕНИЕ: МАКСИМАЛЬНОЕ РАЗРЕШЕНИЕ МАТРИЦЫ\n" +
-                "ОБУЧЕНИЕ: ОТСЕЧЕНИЕ КРАСНОГО ОРЕОЛА СВЕТОДИОДОВ"));
-        trainRow.addView(createAddButton("+ ДЕЙСТВИЕ: 8X СНАЙПЕР-ЗУМ", 0xFF1A4731,
-                "[СКРИПТ ДЕЙСТВИЯ: СНАЙПЕРСКИЙ_ЗАХВАТ]\n" +
-                "ДЕЙСТВИЕ: ТОЧНЫЙ АВТОФОКУС НА МИШЕНЬ\n" +
-                "ДЕЙСТВИЕ: 8-КРАТНАЯ ВЫРЕЗКА ЦЕНТРА БЕЗ МЫЛА"));
+        trainRow.addView(createAddButton("+ ОБУЧЕНИЕ: БЕЗ МЫЛА ЗУМА", 0xFF1F3A52,
+                "[ОБУЧАЮЩИЙ СКРИПТ: ОТКЛЮЧЕНИЕ_МЫЛЬНОГО_ЗУМА]\n" +
+                "ОБУЧЕНИЕ: СЪЕМ ПИКСЕЛЕЙ 1:1 БЕЗ ИНТЕРПОЛЯЦИИ\n" +
+                "ОБУЧЕНИЕ: АВТОПОИСК КРАСНОГО ТАБЛО ЧАСОВ"));
+        trainRow.addView(createAddButton("+ ДЕЙСТВИЕ: МАКРО-ЛУПА ЧАСОВ", 0xFF1A4731,
+                "[СКРИПТ ДЕЙСТВИЯ: ПРОЯВКА_СЕГМЕНТОВ]\n" +
+                "ДЕЙСТВИЕ: ТОЧЕЧНЫЙ ФОКУС ПО ЦЕНТРУ ЛИНЗЫ\n" +
+                "ДЕЙСТВИЕ: ВЫРЕЗКА ТАБЛО И РАЗДЕЛЕНИЕ ЦИФР"));
         layout.addView(trainRow);
 
         // 5. ФАЙЛ / ОЧИСТКА
@@ -293,16 +318,16 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         layout.addView(killBtn);
 
         setContentView(layout);
-        appendScriptToWindow("[СКРИПТ ОПТИКИ: СНАЙПЕРСКАЯ_ПРОЯВКА_ЧАСОВ]\n" +
-                "ОБУЧЕНИЕ: МАКСИМАЛЬНОЕ РАЗРЕШЕНИЕ МАТРИЦЫ\n" +
-                "ОБУЧЕНИЕ: СРЕЗ КРАСНОГО ОРЕОЛА СВЕТОДИОДОВ\n" +
-                "ДЕЙСТВИЕ: ТОЧНЫЙ АВТОФОКУС + 8X ВЫРЕЗКА ЦЕНТРА");
+        appendScriptToWindow("[СКРИПТ ОПТИКИ: ЧИСТАЯ_МАТРИЦА_БЕЗ_МЫЛА]\n" +
+                "ОБУЧЕНИЕ: СЪЕМ ПИКСЕЛЕЙ 1:1 БЕЗ СИСТЕМНОГО ЗУМА\n" +
+                "ДЕЙСТВИЕ: ТОЧЕЧНЫЙ ФОКУС НА ДАЛЬНИЕ ЛАМПЫ/ЧАСЫ\n" +
+                "ДЕЙСТВИЕ: АВТО-ЛУПА НА КРАСНОЕ ТАБЛО ЧАСОВ");
     }
 
     private void executeOpticalScripts() {
-        consoleOutput.append("\n=== СНАЙПЕРСКИЙ РЕЖИМ ОПТИКИ АКТИВИРОВАН ===\n");
-        consoleOutput.append(" -> Выбрано максимальное физическое разрешение сенсора.\n");
-        consoleOutput.append(" -> Наведите часы в зелёный прицел по центру и нажмите ФОКУС + СНАЙПЕР-ПРОЯВКА.\n");
+        consoleOutput.append("\n=== ВКЛЮЧЕН ПРЯМОЙ СЪЕМ МАТРИЦЫ 1:1 ===\n");
+        consoleOutput.append(" -> Шаг 1: Наведите центр на часы и нажмите ЖЕЛТУЮ кнопку '1. НАВЕСТИ РЕЗКОСТЬ' (чтобы лампы стали маленькими точками).\n");
+        consoleOutput.append(" -> Шаг 2: Нажмите ЗЕЛЕНУЮ кнопку '2. ВЫДЕЛИТЬ ЧАСЫ'.\n");
         scrollToBottom(consoleScroll);
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
@@ -335,17 +360,17 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             }
             mCamera.setPreviewDisplay(surfaceHolder);
             mCamera.startPreview();
-            applyHardwareParameters();
+            setupPureSensorParameters();
         } catch (Exception ignored) {}
     }
 
-    // Установка максимальных мегапикселей матрицы, зума и среза ореола
-    private void applyHardwareParameters() {
+    // Главное отличие: умеренный оптический зум (только 30%, где нет мыла и работает точный фокус!) + максимум мегапикселей
+    private void setupPureSensorParameters() {
         if (mCamera == null) return;
         try {
             Camera.Parameters params = mCamera.getParameters();
 
-            // 1. Выбираем САМОЕ БОЛЬШОЕ физическое разрешение матрицы (максимум мегапикселей)
+            // 1. Максимальное разрешение матрицы
             List<Camera.Size> sizes = params.getSupportedPictureSizes();
             if (sizes != null && !sizes.isEmpty()) {
                 Camera.Size best = sizes.get(0);
@@ -358,19 +383,29 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             }
             params.setJpegQuality(100);
 
-            // 2. Зум
+            // 2. Ставим зум только на 25% от максимума — это даёт крупный план в прицеле, но НЕ включает мыльную интерполяцию и НЕ сбивает линзу!
             if (params.isZoomSupported()) {
-                int maxZ = params.getMaxZoom();
-                params.setZoom((maxZ * zoomPercent) / 100);
+                params.setZoom(params.getMaxZoom() / 4);
             }
 
-            // 3. Максимальное притемнение экспозиции (чтобы яркие цифры часов не сливались в пятно)
+            // 3. Умеренное притемнение (-60% от минимума), чтобы часы не перегорали, но сохраняли чёткие палочки
             int minExp = params.getMinExposureCompensation();
             if (minExp < 0) {
-                params.setExposureCompensation((minExp * exposureDarkenPercent) / 100);
+                params.setExposureCompensation((minExp * 60) / 100);
             }
 
-            // 4. Режим точного автофокуса
+            // 4. Задаём центральную снайперскую зону фокусировки (100x100 в самом центре кадра)
+            if (params.getMaxNumFocusAreas() > 0) {
+                List<Camera.Area> focusAreas = new ArrayList<>();
+                focusAreas.add(new Camera.Area(new Rect(-150, -150, 150, 150), 1000));
+                params.setFocusAreas(focusAreas);
+            }
+            if (params.getMaxNumMeteringAreas() > 0) {
+                List<Camera.Area> meterAreas = new ArrayList<>();
+                meterAreas.add(new Camera.Area(new Rect(-150, -150, 150, 150), 1000));
+                params.setMeteringAreas(meterAreas);
+            }
+
             List<String> focusModes = params.getSupportedFocusModes();
             if (focusModes != null && focusModes.contains(Camera.Parameters.FOCUS_MODE_AUTO)) {
                 params.setFocusMode(Camera.Parameters.FOCUS_MODE_AUTO);
@@ -380,26 +415,30 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         } catch (Exception ignored) {}
     }
 
-    // Сначала точная фокусировка линзы на часы, затем мгновенный снимок
-    private void focusAndCaptureSniperClock() {
+    // Принудительная точечная фокусировка линзы по центру (убирает круги боке на лампах!)
+    private void triggerExactCenterFocus() {
         if (mCamera == null) return;
-        consoleOutput.append(" -> Точная наводка линзы на цель и захват кадра...\n");
+        consoleOutput.append(" -> Наводка резкости линзы точно по центру...\n");
         scrollToBottom(consoleScroll);
-
         try {
+            mCamera.cancelAutoFocus();
+            setupPureSensorParameters();
             mCamera.autoFocus(new Camera.AutoFocusCallback() {
                 @Override
                 public void onAutoFocus(boolean success, Camera camera) {
-                    takeHighResPicture();
+                    consoleOutput.append(" -> Резкость зафиксирована! Теперь жмите '2. ВЫДЕЛИТЬ ЧАСЫ'.\n");
+                    scrollToBottom(consoleScroll);
                 }
             });
-        } catch (Exception e) {
-            takeHighResPicture();
-        }
+        } catch (Exception ignored) {}
     }
 
-    private void takeHighResPicture() {
+    // Захват чистого кадра матрицы и автоматический поиск красного табло часов в центральной зоне
+    private void takePureMatrixPicture() {
         if (mCamera == null) return;
+        consoleOutput.append(" -> Съём полных мегапикселей матрицы и поиск табло часов...\n");
+        scrollToBottom(consoleScroll);
+
         mCamera.takePicture(null, null, new Camera.PictureCallback() {
             @Override
             public void onPictureTaken(byte[] data, Camera camera) {
@@ -408,23 +447,23 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                     Matrix rot = new Matrix();
                     rot.postRotate(90);
 
-                    // Снайперская вырезка центральной зоны (1/5 кадра по центру, где находятся часы)
+                    // Вырезаем центральную зону из полного кадра
                     int w = raw.getWidth();
                     int h = raw.getHeight();
-                    int cropW = w / 4;
-                    int cropH = h / 4;
+                    int divisor = 2 + (cropPowerPercent / 20); // от 3x до 7x чистых пикселей
+                    int cropW = w / divisor;
+                    int cropH = h / divisor;
                     int startX = (w - cropW) / 2;
                     int startY = (h - cropH) / 2;
 
-                    Bitmap cropped = Bitmap.createBitmap(raw, startX, startY, cropW, cropH, rot, true);
+                    Bitmap centerZone = Bitmap.createBitmap(raw, startX, startY, cropW, cropH, rot, true);
 
-                    // Прогоняем через алгоритм разделения слипшихся сегментов цифр
-                    Bitmap enhanced = separateLedDigitsMatrix(cropped);
+                    // Автоматически находим красное табло часов внутри центральной зоны и делаем Макро-Вырезку!
+                    Bitmap clockMacro = autoLocateAndEnhanceRedClock(centerZone);
 
-                    resultImageView.setImageBitmap(enhanced);
+                    resultImageView.setImageBitmap(clockMacro);
                     resultImageView.setVisibility(View.VISIBLE);
-                    consoleOutput.append(" === ГОТОВО: Снайперский кроп " + cropped.getWidth() + "x" + cropped.getHeight() +
-                            " пкс проявлен, ореол срезан! ===\n");
+                    consoleOutput.append(" === ГОТОВО: Табло часов найдено и выведено крупным планом! ===\n");
                     scrollToBottom(consoleScroll);
                 } catch (Exception e) {
                     consoleOutput.append(" [Ошибка]: " + e.getMessage() + "\n");
@@ -433,57 +472,78 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         });
     }
 
-    // Специальная матрица СВЕД для разделения светящихся сегментов цифр на дальних табло
-    private Bitmap separateLedDigitsMatrix(Bitmap src) {
-        int width = src.getWidth();
-        int height = src.getHeight();
-        int[] pixels = new int[width * height];
-        int[] step1 = new int[width * height];
-        int[] outPixels = new int[width * height];
-        src.getPixels(pixels, 0, width, 0, 0, width, height);
+    // Алгоритм СВЕД: находит скопление красных пикселей часов, вырезает именно табло и разделяет палочки цифр
+    private Bitmap autoLocateAndEnhanceRedClock(Bitmap src) {
+        int w = src.getWidth();
+        int h = src.getHeight();
+        int[] pixels = new int[w * h];
+        src.getPixels(pixels, 0, w, 0, 0, w, h);
 
-        // Шаг 1: Нелинейное подавление ореола (Гамма-срез: слабый ореол вокруг цифр гасится в ноль, остаётся только стержень цифры)
-        for (int i = 0; i < pixels.length; i++) {
-            int c = pixels[i];
+        // 1. Ищем центр тяжести красного свечения часов (чтобы приблизить именно само табло!)
+        long sumX = 0, sumY = 0, count = 0;
+        int maxRedFound = 0;
+
+        for (int y = h / 6; y < (h * 5) / 6; y++) {
+            for (int x = w / 6; x < (w * 5) / 6; x++) {
+                int c = pixels[y * w + x];
+                int r = Color.red(c);
+                int g = Color.green(c);
+                int b = Color.blue(c);
+                // Признак светящегося красного табло: красный доминирует над зелёным и синим
+                if (r > 70 && r > (g * 1.6f) && r > (b * 1.6f)) {
+                    sumX += x;
+                    sumY += y;
+                    count++;
+                    if (r > maxRedFound) maxRedFound = r;
+                }
+            }
+        }
+
+        Bitmap targetCrop = src;
+        // Если нашли красное табло часов — вырезаем прицельное окно прямо вокруг него!
+        if (count > 10) {
+            int centerX = (int) (sumX / count);
+            int centerY = (int) (sumY / count);
+            int boxW = Math.max(160, w / 3);
+            int boxH = Math.max(120, h / 4);
+            int left = Math.max(0, Math.min(w - boxW, centerX - boxW / 2));
+            int top = Math.max(0, Math.min(h - boxH, centerY - boxH / 2));
+            targetCrop = Bitmap.createBitmap(src, left, top, boxW, boxH);
+        }
+
+        // 2. Адаптивное разделение сегментов цифр внутри найденного табло
+        int tw = targetCrop.getWidth();
+        int th = targetCrop.getHeight();
+        int[] tPixels = new int[tw * th];
+        int[] outPixels = new int[tw * th];
+        targetCrop.getPixels(tPixels, 0, tw, 0, 0, tw, th);
+
+        // Вычисляем порог между яркими палочками цифр и тусклым ореолом между ними
+        int cutoff = (maxRedFound > 90) ? (int) (maxRedFound * (0.35f + (redCutoffThreshold / 220.0f))) : 80;
+
+        for (int i = 0; i < tPixels.length; i++) {
+            int c = tPixels[i];
             int r = Color.red(c);
             int g = Color.green(c);
             int b = Color.blue(c);
 
-            // Если это красное свечение табло (красный сильно выше синего/зелёного)
-            if (r > g + 25 && r > b + 25) {
-                // Срезаем размытый ореол вокруг сегментов: возводим яркость в куб, чтобы края цифр стали тонкими и раздельными
-                float normR = r / 255.0f;
-                int sharpRed = clamp((int) (Math.pow(normR, 2.8) * 280.0f));
-                int coreYellow = (r > 220 && g > 120) ? clamp((int) (Math.pow(g / 255.0f, 3.0) * 255.0f)) : 0;
-                step1[i] = Color.rgb(sharpRed, coreYellow, 0);
+            int redness = r - Math.max(g, b);
+            if (redness > 25 && r >= cutoff) {
+                // Это сама светящаяся палочка цифры — делаем её максимально чёткой и яркой (янтарно-красной)
+                int boost = clamp((r - cutoff) * 4 + 120);
+                outPixels[i] = Color.rgb(boost, boost / 3, 0);
+            } else if (redness > 15 && r < cutoff) {
+                // Это паразитный красный ореол между палочками цифр — гасим его в глубокий чёрный!
+                outPixels[i] = Color.rgb(10, 0, 0);
             } else {
-                // Остальной фон (балки, стены) делаем умеренно контрастным без шума
+                // Контуры корпуса часов и стены вокруг
                 int luma = (r + g + b) / 3;
-                int clean = clamp((int) ((luma - 40) * 1.3f));
-                step1[i] = Color.rgb(clean, clean, clean);
+                outPixels[i] = Color.rgb(luma, luma, luma);
             }
         }
 
-        // Шаг 2: Контурная матрица высокой резкости 3x3
-        for (int y = 1; y < height - 1; y++) {
-            for (int x = 1; x < width - 1; x++) {
-                int idx = y * width + x;
-                int c = step1[idx];
-                int top = step1[(y - 1) * width + x];
-                int bottom = step1[(y + 1) * width + x];
-                int left = step1[y * width + (x - 1)];
-                int right = step1[y * width + (x + 1)];
-
-                int r = clamp(5 * Color.red(c) - Color.red(top) - Color.red(bottom) - Color.red(left) - Color.red(right));
-                int g = clamp(5 * Color.green(c) - Color.green(top) - Color.green(bottom) - Color.green(left) - Color.green(right));
-                int b = clamp(5 * Color.blue(c) - Color.blue(top) - Color.blue(bottom) - Color.blue(left) - Color.blue(right));
-
-                outPixels[idx] = Color.rgb(r, g, b);
-            }
-        }
-
-        Bitmap finalBmp = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888);
-        finalBmp.setPixels(outPixels, 0, width, 0, 0, width, height);
+        Bitmap finalBmp = Bitmap.createBitmap(tw, th, Bitmap.Config.ARGB_8888);
+        finalBmp.setPixels(outPixels, 0, tw, 0, 0, tw, th);
         return finalBmp;
     }
 
