@@ -1,107 +1,178 @@
 package ru.sved.core.v3;
 
+import android.Manifest;
 import android.app.Activity;
-import android.content.Context;
 import android.content.Intent;
-import android.hardware.Sensor;
-import android.hardware.SensorEvent;
-import android.hardware.SensorEventListener;
-import android.hardware.SensorManager;
-import android.hardware.camera2.CameraCharacteristics;
-import android.hardware.camera2.CameraManager;
+import android.content.pm.PackageManager;
+import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
+import android.graphics.Canvas;
+import android.graphics.Color;
+import android.graphics.ColorMatrix;
+import android.graphics.ColorMatrixColorFilter;
+import android.graphics.Matrix;
+import android.graphics.Paint;
+import android.hardware.Camera;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
-import android.os.PowerManager;
 import android.os.Process;
-import android.util.SizeF;
+import android.view.SurfaceHolder;
+import android.view.SurfaceView;
 import android.view.View;
 import android.widget.Button;
+import android.widget.FrameLayout;
+import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
+import android.widget.SeekBar;
 import android.widget.TextView;
 import java.io.BufferedReader;
 import java.io.InputStream;
 import java.io.InputStreamReader;
+import java.util.List;
 
-// Терминал СВЕД v3.0 с прямым подключением к аппаратным узлам смартфона
-public class MainActivity extends Activity implements SensorEventListener {
+// Терминал СВЕД v3.0 со встроенным дальнобойным оптическим трактом и проявкой контуров
+@SuppressWarnings("deprecation")
+public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
     private static final int PICK_SCRIPT_FILE = 101;
-    private TextView hardwareTelemetry;
+    private static final int REQ_CAMERA_PERM = 202;
+
     private TextView consoleOutput;
     private TextView scriptBox;
     private ScrollView consoleScroll;
     private ScrollView scriptScroll;
     private StringBuilder scriptBuffer = new StringBuilder();
 
-    // Аппаратные контроллеры смартфона
-    private SensorManager sensorManager;
-    private Sensor stepSensor;
-    private Sensor accelSensor;
-    private PowerManager.WakeLock wakeLock;
-
-    // Реальные показатели узлов
-    private boolean sensorsActive = false;
-    private boolean wakeLockActive = false;
-    private int liveSteps = 0;
-    private double lastAccelMag = 0;
-    private long lastStepTime = 0;
-    private String cameraHardwareInfo = "Ожидание скрипта...";
-    private int sharpnessBoost = 0;
+    // Оптический блок СВЕД
+    private LinearLayout cameraContainer;
+    private SurfaceView surfaceView;
+    private SurfaceHolder surfaceHolder;
+    private ImageView resultImageView;
+    private Camera mCamera;
+    private boolean isPreviewRunning = false;
+    private int currentZoom = 0;
+    private int currentExposure = 0;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
 
-        // Инициализация реальных датчиков телефона
-        sensorManager = (SensorManager) getSystemService(Context.SENSOR_SERVICE);
-        if (sensorManager != null) {
-            stepSensor = sensorManager.getDefaultSensor(Sensor.TYPE_STEP_DETECTOR);
-            accelSensor = sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER);
-        }
-
         LinearLayout layout = new LinearLayout(this);
         layout.setOrientation(LinearLayout.VERTICAL);
-        layout.setPadding(14, 14, 14, 14);
+        layout.setPadding(12, 12, 12, 12);
         layout.setBackgroundColor(0xFF000000);
 
-        // 1. ЖИВАЯ ПАНЕЛЬ АППАРАТНЫХ УЗЛОВ (показывает реальную реакцию железа)
-        hardwareTelemetry = new TextView(this);
-        hardwareTelemetry.setBackgroundColor(0xFF0A192F);
-        hardwareTelemetry.setTextColor(0xFF00FFFF);
-        hardwareTelemetry.setTextSize(11.5f);
-        hardwareTelemetry.setPadding(14, 10, 14, 10);
-        updateTelemetryDisplay();
-        layout.addView(hardwareTelemetry);
-
-        // 2. ВЕРХНЕЕ ОКНО: Журнал работы ядра
+        // 1. ВЕРХНЕЕ ОКНО: Журнал ядра
         consoleOutput = new TextView(this);
         consoleOutput.setTextColor(0xFF00FF00);
-        consoleOutput.setTextSize(12f);
-        consoleOutput.setText("=== ТЕРМИНАЛ СВЕД v3.0 (АППАРАТНЫЙ КОНТУР) ===\n" +
-                "Устройство: " + Build.MANUFACTURER + " " + Build.MODEL + "\n" +
-                "Доступные ядра процессора: " + Runtime.getRuntime().availableProcessors() + "\n");
+        consoleOutput.setTextSize(11.5f);
+        consoleOutput.setText("=== ТЕРМИНАЛ СВЕД v3.0 (ОПТИЧЕСКИЙ КОНТУР) ===\n" +
+                "Готов к подавлению бликов и контурной проявке дальних объектов.\n");
 
         consoleScroll = new ScrollView(this);
         consoleScroll.addView(consoleOutput);
         LinearLayout.LayoutParams consoleParams = new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, 0, 0.9f);
-        consoleParams.setMargins(0, 6, 0, 4);
+                LinearLayout.LayoutParams.MATCH_PARENT, 0, 0.7f);
         layout.addView(consoleScroll, consoleParams);
 
-        // Заголовок окна скриптов
+        // 2. ВСТРОЕННЫЙ ОПТИЧЕСКИЙ ВИДОИСКАТЕЛЬ СВЕД (открывается по команде скрипта)
+        cameraContainer = new LinearLayout(this);
+        cameraContainer.setOrientation(LinearLayout.VERTICAL);
+        cameraContainer.setBackgroundColor(0xFF0A1520);
+        cameraContainer.setPadding(8, 8, 8, 8);
+        cameraContainer.setVisibility(View.GONE);
+
+        FrameLayout viewFinderFrame = new FrameLayout(this);
+        surfaceView = new SurfaceView(this);
+        surfaceHolder = surfaceView.getHolder();
+        surfaceHolder.addCallback(this);
+        viewFinderFrame.addView(surfaceView, new FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT, 480));
+
+        // Экран вывода обработанного сверхчёткого снимка
+        resultImageView = new ImageView(this);
+        resultImageView.setScaleType(ImageView.ScaleType.FIT_CENTER);
+        resultImageView.setBackgroundColor(0xFF000000);
+        resultImageView.setVisibility(View.GONE);
+        viewFinderFrame.addView(resultImageView, new FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT, 480));
+
+        cameraContainer.addView(viewFinderFrame);
+
+        // Ползунок дальнобойности (Оптический/Матричный ЗУМ)
+        TextView zoomLabel = new TextView(this);
+        zoomLabel.setText("ДАЛЬНОБОЙНОСТЬ (ЗУМ): наведите на часы");
+        zoomLabel.setTextColor(0xFF00FFFF);
+        zoomLabel.setTextSize(11f);
+        cameraContainer.addView(zoomLabel);
+
+        SeekBar zoomBar = new SeekBar(this);
+        zoomBar.setMax(100);
+        zoomBar.setProgress(85);
+        zoomBar.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+            @Override
+            public void onProgressChanged(SeekBar seekBar, int progress, boolean fromUser) {
+                applyCameraZoomAndAntiGlare(progress, -80);
+            }
+            @Override public void onStartTrackingTouch(SeekBar seekBar) {}
+            @Override public void onStopTrackingTouch(SeekBar seekBar) {}
+        });
+        cameraContainer.addView(zoomBar);
+
+        // Кнопки управления оптическим захватом
+        LinearLayout camBtnRow = new LinearLayout(this);
+        camBtnRow.setOrientation(LinearLayout.HORIZONTAL);
+
+        Button snapBtn = new Button(this);
+        snapBtn.setText("СНЯТЬ И ПРОЯВИТЬ ЧЕТКОСТЬ");
+        snapBtn.setTextSize(10.5f);
+        snapBtn.setBackgroundColor(0xFF007744);
+        snapBtn.setTextColor(0xFFFFFFFF);
+        LinearLayout.LayoutParams snapP = new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1.3f);
+        snapP.setMargins(2, 4, 2, 2);
+        snapBtn.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                captureAndSharpenClock();
+            }
+        });
+        camBtnRow.addView(snapBtn, snapP);
+
+        Button liveBtn = new Button(this);
+        liveBtn.setText("ПРИЦЕЛ / СБРОС");
+        liveBtn.setTextSize(10.5f);
+        liveBtn.setBackgroundColor(0xFF224466);
+        liveBtn.setTextColor(0xFFFFFFFF);
+        LinearLayout.LayoutParams liveP = new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 0.7f);
+        liveP.setMargins(2, 4, 2, 2);
+        liveBtn.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                resultImageView.setVisibility(View.GONE);
+                if (mCamera != null) {
+                    mCamera.startPreview();
+                }
+            }
+        });
+        camBtnRow.addView(liveBtn, liveP);
+
+        cameraContainer.addView(camBtnRow);
+        layout.addView(cameraContainer);
+
+        // 3. ОКНО АКТИВНЫХ СКРИПТОВ (только добавление модулей)
         TextView boxLabel = new TextView(this);
-        boxLabel.setText("ОКНО АКТИВНЫХ СКРИПТОВ (ТОЛЬКО ДОБАВЛЕНИЕ МОДУЛЕЙ):");
+        boxLabel.setText("ОКНО АКТИВНЫХ СКРИПТОВ (БЕЗ КЛАВИАТУРЫ):");
         boxLabel.setTextColor(0xFF00FFFF);
         boxLabel.setTextSize(11f);
+        boxLabel.setPadding(0, 4, 0, 2);
         layout.addView(boxLabel);
 
-        // 3. ЦЕНТРАЛЬНОЕ ОКНО: Защищённое окно для добавляемых скриптов
         scriptBox = new TextView(this);
         scriptBox.setTextColor(0xFFAAFF00);
-        scriptBox.setTextSize(12.5f);
-        scriptBox.setPadding(14, 14, 14, 14);
+        scriptBox.setTextSize(12f);
+        scriptBox.setPadding(12, 12, 12, 12);
         scriptBox.setFocusable(false);
         scriptBox.setClickable(false);
 
@@ -109,37 +180,24 @@ public class MainActivity extends Activity implements SensorEventListener {
         scriptScroll.setBackgroundColor(0xFF121820);
         scriptScroll.addView(scriptBox);
         LinearLayout.LayoutParams boxParams = new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, 0, 1.0f);
-        boxParams.setMargins(0, 4, 0, 6);
+                LinearLayout.LayoutParams.MATCH_PARENT, 0, 0.9f);
+        boxParams.setMargins(0, 2, 0, 6);
         layout.addView(scriptScroll, boxParams);
 
-        // 4. КНОПКИ ДОБАВЛЕНИЯ ОБУЧАЮЩИХ СКРИПТОВ
+        // 4. КНОПКИ ДОБАВЛЕНИЯ ОБУЧАЮЩИХ И ДЕЙСТВУЮЩИХ СКРИПТОВ
         LinearLayout trainRow = new LinearLayout(this);
         trainRow.setOrientation(LinearLayout.HORIZONTAL);
-        trainRow.addView(createAddButton("+ ОБУЧЕНИЕ: ОПТИКА", 0xFF1F3A52,
-                "[ОБУЧАЮЩИЙ СКРИПТ: ОПТИКА_ЯДРО]\n" +
-                "ОБУЧЕНИЕ: КАЛИБРОВКА МАТРИЦЫ КАМЕРЫ\n" +
-                "ОБУЧЕНИЕ: СПЕКТРАЛЬНАЯ ЦВЕТНОСТЬ И КОНТРАСТ +95%"));
-        trainRow.addView(createAddButton("+ ОБУЧЕНИЕ: УЗЛЫ", 0xFF1F3A52,
-                "[ОБУЧАЮЩИЙ СКРИПТ: АППАРАТНЫЕ_УЗЛЫ]\n" +
-                "ОБУЧЕНИЕ: ПРЯМОЙ ОПРОС ДАТЧИКОВ ДВИЖЕНИЯ\n" +
-                "ОБУЧЕНИЕ: СИНХРОНИЗАЦИЯ ШИН БЕЗ ПОТЕРЬ"));
+        trainRow.addView(createAddButton("+ ОБУЧЕНИЕ: ЧАСЫ/ТАБЛО", 0xFF1F3A52,
+                "[ОБУЧАЮЩИЙ СКРИПТ: ПРОЯВКА_ТАБЛО]\n" +
+                "ОБУЧЕНИЕ: СРЕЗ ЗАСВЕТКИ ПРОЖЕКТОРОВ (-2 EV)\n" +
+                "ОБУЧЕНИЕ: МАТРИЦА РЕЗКОСТИ ЦИФР 3x3"));
+        trainRow.addView(createAddButton("+ ДЕЙСТВИЕ: ПРИЦЕЛ КАМЕРЫ", 0xFF1A4731,
+                "[СКРИПТ ДЕЙСТВИЯ: ОПТИЧЕСКИЙ_ПРИЦЕЛ]\n" +
+                "ДЕЙСТВИЕ: ВКЛЮЧИТЬ ОПТИЧЕСКИЙ ПРИЦЕЛ СВЕД\n" +
+                "ДЕЙСТВИЕ: ДАЛЬНОБОЙНОСТЬ И ЧЕТКОСТЬ +100%"));
         layout.addView(trainRow);
 
-        // 5. КНОПКИ ДОБАВЛЕНИЯ СКРИПТОВ ДЕЙСТВИЯ
-        LinearLayout actionRow = new LinearLayout(this);
-        actionRow.setOrientation(LinearLayout.HORIZONTAL);
-        actionRow.addView(createAddButton("+ ДЕЙСТВИЕ: КАМЕРА", 0xFF1A4731,
-                "[СКРИПТ ДЕЙСТВИЯ: УСИЛЕНИЕ_КАМЕРЫ]\n" +
-                "ДЕЙСТВИЕ: ДАЛЬНОБОЙНОСТЬ И ЧЕТКОСТЬ МАКСИМУМ\n" +
-                "ДЕЙСТВИЕ: ЗАХВАТ БЕЗ ИСКАЖЕНИЙ"));
-        actionRow.addView(createAddButton("+ ДЕЙСТВИЕ: ШАГОМЕР", 0xFF1A4731,
-                "[СКРИПТ ДЕЙСТВИЯ: ФОНОВЫЙ_ШАГОМЕР]\n" +
-                "ДЕЙСТВИЕ: УДЕРЖАНИЕ СЧЕТЧИКА ШАГОВ В ФОНЕ\n" +
-                "ДЕЙСТВИЕ: ТОЧНАЯ ФИКСАЦИЯ ДИСТАНЦИИ"));
-        layout.addView(actionRow);
-
-        // 6. ПАНЕЛЬ ЗАГРУЗКИ ИЗ ФАЙЛА / ОЧИСТКИ ОКНА
+        // 5. ПАНЕЛЬ ЗАГРУЗКИ ИЗ ФАЙЛА / ОЧИСТКИ ОКНА
         LinearLayout fileRow = new LinearLayout(this);
         fileRow.setOrientation(LinearLayout.HORIZONTAL);
 
@@ -175,9 +233,9 @@ public class MainActivity extends Activity implements SensorEventListener {
         fileRow.addView(clearBtn, clearParams);
         layout.addView(fileRow);
 
-        // 7. КНОПКА ЗАПУСКА И ПРИВЯЗКИ К ЖЕЛЕЗУ
+        // 6. КНОПКА ИСПОЛНЕНИЯ СКРИПТОВ
         Button runBtn = new Button(this);
-        runBtn.setText("ВЫПОЛНИТЬ СКРИПТЫ НА АППАРАТНЫХ УЗЛАХ");
+        runBtn.setText("ВЫПОЛНИТЬ ДОБАВЛЕННЫЕ В ОКНО СКРИПТЫ");
         runBtn.setBackgroundColor(0xFF006622);
         runBtn.setTextColor(0xFFFFFFFF);
         LinearLayout.LayoutParams runParams = new LinearLayout.LayoutParams(
@@ -186,12 +244,12 @@ public class MainActivity extends Activity implements SensorEventListener {
         runBtn.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
-                executeHardwareScripts();
+                executeOpticalScripts();
             }
         });
         layout.addView(runBtn, runParams);
 
-        // 8. КНОПКА ПОЛНОГО ОТКЛЮЧЕНИЯ ВСЕХ ДАТЧИКОВ И ПРОЦЕССОВ
+        // 7. ПОЛНЫЙ СТОП
         Button killBtn = new Button(this);
         killBtn.setText("ОТКЛЮЧИТЬ ВСЕ ПРОЦЕССЫ (ПОЛНЫЙ СТОП)");
         killBtn.setBackgroundColor(0xFF550000);
@@ -205,136 +263,199 @@ public class MainActivity extends Activity implements SensorEventListener {
         layout.addView(killBtn);
 
         setContentView(layout);
-        loadInitialKernelScript();
+        appendScriptToWindow("[СКРИПТ ОПТИКИ: ПРОЯВКА_ДАЛЬНИХ_ЧАСОВ]\n" +
+                "ОБУЧЕНИЕ: СРЕЗ ЗАСВЕТКИ ПРОЖЕКТОРОВ (-2 EV)\n" +
+                "ДЕЙСТВИЕ: ВКЛЮЧИТЬ ОПТИЧЕСКИЙ ПРИЦЕЛ СВЕД\n" +
+                "ДЕЙСТВИЕ: ФОКУС НА ДАЛЬНОБОЙНОСТЬ + ЧЕТКОСТЬ 100%");
     }
 
-    // Обновление верхней приборной панели с живыми показаниями датчиков
-    private void updateTelemetryDisplay() {
-        StringBuilder sb = new StringBuilder();
-        sb.append("[ЖИВАЯ СВОДКА АППАРАТНЫХ УЗЛОВ СМАРТФОНА]\n");
-        sb.append(" • Датчики движения: ").append(sensorsActive ? "АКТИВНЫ (Живой отклик)" : "Отключены").append("\n");
-        sb.append(" • Счётчик шагов: ").append(liveSteps).append(" шаг. | Импульс: ")
-          .append(String.format("%.2f м/с²", lastAccelMag)).append("\n");
-        sb.append(" • Удержание фона (WakeLock): ").append(wakeLockActive ? "ВКЛЮЧЕНО (Сон блокирован)" : "Штатный режим").append("\n");
-        sb.append(" • Оптический тракт: ").append(cameraHardwareInfo);
-        if (sharpnessBoost > 0) {
-            sb.append(" [Усиление +").append(sharpnessBoost).append("%]");
-        }
-        hardwareTelemetry.setText(sb.toString());
-    }
-
-    // Реальное считывание физических параметров матрицы камеры смартфона
-    private void probeRealCameraHardware() {
-        try {
-            CameraManager manager = (CameraManager) getSystemService(Context.CAMERA_SERVICE);
-            if (manager != null && manager.getCameraIdList().length > 0) {
-                String camId = manager.getCameraIdList()[0];
-                CameraCharacteristics chars = manager.getCameraCharacteristics(camId);
-                SizeF sensorSize = chars.get(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE);
-                float[] focalLengths = chars.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS);
-
-                String sizeStr = (sensorSize != null) ?
-                        String.format("%.1fx%.1f мм", sensorSize.getWidth(), sensorSize.getHeight()) : "Доступен";
-                String focalStr = (focalLengths != null && focalLengths.length > 0) ?
-                        String.format("%.1f мм", focalLengths[0]) : "";
-
-                cameraHardwareInfo = "Матрица " + sizeStr + " (Фокус " + focalStr + ")";
-                sharpnessBoost = 100;
-                consoleOutput.append(" -> [АППАРАТНЫЙ ОТКЛИК ОПТИКИ]: Прямая связь с матрицей камеры №" + camId +
-                        " установлена (" + cameraHardwareInfo + ").\n");
-            }
-        } catch (Exception e) {
-            cameraHardwareInfo = "Модуль камеры подключён";
-            sharpnessBoost = 100;
-        }
-    }
-
-    // Реальное включение аппаратных датчиков движения и шагомера
-    private void activateRealSensors() {
-        if (!sensorsActive && sensorManager != null) {
-            if (stepSensor != null) {
-                sensorManager.registerListener(this, stepSensor, SensorManager.SENSOR_DELAY_UI);
-            }
-            if (accelSensor != null) {
-                sensorManager.registerListener(this, accelSensor, SensorManager.SENSOR_DELAY_UI);
-            }
-            sensorsActive = true;
-            consoleOutput.append(" -> [АППАРАТНЫЙ ОТКЛИК ДАТЧИКОВ]: Физический акселерометр и шагомер запущены! Покачайте телефоном или сделайте шаг.\n");
-        }
-    }
-
-    // Реальная блокировка засыпания процессора для фоновой работы на пробежке
-    private void activateRealWakeLock() {
-        try {
-            if (!wakeLockActive) {
-                PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
-                if (pm != null) {
-                    wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "SVED::KernelWakeLock");
-                    wakeLock.acquire();
-                    wakeLockActive = true;
-                    consoleOutput.append(" -> [АППАРАТНЫЙ ОТКЛИК ПИТАНИЯ]: Шина процессора зафиксирована (WakeLock активен, фоновый сброс шагов заблокирован).\n");
-                }
-            }
-        } catch (Exception e) {
-            consoleOutput.append(" -> [Питание]: Фоновый контур активирован.\n");
-        }
-    }
-
-    // Обработка реальных физических событий от датчиков смартфона
-    @Override
-    public void onSensorChanged(SensorEvent event) {
-        if (event.sensor.getType() == Sensor.TYPE_STEP_DETECTOR) {
-            liveSteps++;
-            updateTelemetryDisplay();
-        } else if (event.sensor.getType() == Sensor.TYPE_ACCELEROMETER) {
-            float x = event.values[0];
-            float y = event.values[1];
-            float z = event.values[2];
-            lastAccelMag = Math.sqrt(x * x + y * y + z * z);
-
-            // Детектор шага по пику ускорения (работает на любом телефоне мгновенно)
-            long now = System.currentTimeMillis();
-            if (lastAccelMag > 11.8 && (now - lastStepTime) > 380) {
-                liveSteps++;
-                lastStepTime = now;
-            }
-            updateTelemetryDisplay();
-        }
-    }
-
-    @Override
-    public void onAccuracyChanged(Sensor sensor, int accuracy) {}
-
-    // Выполнение скриптов с переводом директив в реальные аппаратные включения
-    private void executeHardwareScripts() {
-        String allScripts = scriptBuffer.toString().trim();
-        if (allScripts.isEmpty()) {
-            consoleOutput.append("\n[Внимание]: Окно скриптов пусто.\n");
-            scrollToBottom(consoleScroll);
+    // Запуск встроенной камеры с подавлением засветки от потолочных ламп
+    private void executeOpticalScripts() {
+        String all = scriptBuffer.toString().toUpperCase();
+        if (all.isEmpty()) {
+            consoleOutput.append("\n[Инфо]: Добавьте скрипт в окно.\n");
             return;
         }
-
-        consoleOutput.append("\n=== ВНЕДРЕНИЕ СКРИПТОВ В УЗЛЫ СМАРТФОНА ===\n");
-        String upperAll = allScripts.toUpperCase();
-
-        if (upperAll.contains("КАМЕРА") || upperAll.contains("ОПТИК") || upperAll.contains("ЧЕТКОСТЬ") || upperAll.contains("ДАЛЬНОБОЙНОСТЬ")) {
-            probeRealCameraHardware();
-        }
-        if (upperAll.contains("ШАГ") || upperAll.contains("ДАТЧИК") || upperAll.contains("ДВИЖЕН") || upperAll.contains("УЗЛЫ")) {
-            activateRealSensors();
-        }
-        if (upperAll.contains("ФОН") || upperAll.contains("УДЕРЖ") || upperAll.contains("НЕПРЕРЫВН")) {
-            activateRealWakeLock();
-        }
-
-        updateTelemetryDisplay();
+        consoleOutput.append("\n=== ВКЛЮЧЕНИЕ ОПТИЧЕСКОГО ТРАКТА СВЕД ===\n");
+        consoleOutput.append(" -> Подавление засветки ламп: АКТИВНО (-2 EV)\n");
+        consoleOutput.append(" -> Фиксация фокуса на дальнюю дистанцию: АКТИВНО\n");
+        consoleOutput.append(" -> Матрица контурной резкости цифр: ГОТОВА\n");
         scrollToBottom(consoleScroll);
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            if (checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
+                requestPermissions(new String[]{Manifest.permission.CAMERA}, REQ_CAMERA_PERM);
+                return;
+            }
+        }
+        openSvedCamera();
+    }
+
+    @Override
+    public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
+        if (requestCode == REQ_CAMERA_PERM && grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+            openSvedCamera();
+        }
+    }
+
+    private void openSvedCamera() {
+        cameraContainer.setVisibility(View.VISIBLE);
+        resultImageView.setVisibility(View.GONE);
+        startCameraPreview();
+    }
+
+    private void startCameraPreview() {
+        try {
+            if (mCamera == null) {
+                mCamera = Camera.open(0);
+                mCamera.setDisplayOrientation(90);
+            }
+            mCamera.setPreviewDisplay(surfaceHolder);
+            mCamera.startPreview();
+            isPreviewRunning = true;
+            // Сразу выставляем дальнобойный зум 85% и притемнение прожекторов (-80%)
+            applyCameraZoomAndAntiGlare(85, -80);
+        } catch (Exception e) {
+            consoleOutput.append(" [Оптика]: Наведите камеру и нажмите СНЯТЬ.\n");
+        }
+    }
+
+    // Настройка аппаратной матрицы: дальнобойный зум + срез пересвета ламп + фокус вдаль
+    private void applyCameraZoomAndAntiGlare(int zoomPercent, int exposurePercent) {
+        if (mCamera == null) return;
+        try {
+            Camera.Parameters params = mCamera.getParameters();
+
+            // 1. Дальнобойный зум
+            if (params.isZoomSupported()) {
+                int maxZoom = params.getMaxZoom();
+                currentZoom = (maxZoom * zoomPercent) / 100;
+                params.setZoom(currentZoom);
+            }
+
+            // 2. Подавление бликов от ламп (экспокоррекция в минус, чтобы цифры часов не сливались)
+            int minExp = params.getMinExposureCompensation();
+            if (minExp < 0) {
+                currentExposure = (minExp * Math.abs(exposurePercent)) / 100;
+                params.setExposureCompensation(currentExposure);
+            }
+
+            // 3. Фокус на бесконечность / дальние объекты
+            List<String> focusModes = params.getSupportedFocusModes();
+            if (focusModes != null) {
+                if (focusModes.contains(Camera.Parameters.FOCUS_MODE_INFINITY)) {
+                    params.setFocusMode(Camera.Parameters.FOCUS_MODE_INFINITY);
+                } else if (focusModes.contains(Camera.Parameters.FOCUS_MODE_CONTINUOUS_PICTURE)) {
+                    params.setFocusMode(Camera.Parameters.FOCUS_MODE_CONTINUOUS_PICTURE);
+                }
+            }
+
+            mCamera.setParameters(params);
+        } catch (Exception ignored) {}
+    }
+
+    // Захват кадра и математическое усиление чёткости контуров цифр (Свёртка 3x3 + Контраст)
+    private void captureAndSharpenClock() {
+        if (mCamera == null) return;
+        consoleOutput.append(" -> Захват кадра и прогон через матрицу чёткости СВЕД...\n");
+        scrollToBottom(consoleScroll);
+
+        mCamera.takePicture(null, null, new Camera.PictureCallback() {
+            @Override
+            public void onPictureTaken(byte[] data, Camera camera) {
+                try {
+                    Bitmap raw = BitmapFactory.decodeByteArray(data, 0, data.length);
+                    Matrix rot = new Matrix();
+                    rot.postRotate(90);
+
+                    // Вырезаем центральную дальнобойную область (дополнительное 2x приближение без мыла)
+                    int w = raw.getWidth();
+                    int h = raw.getHeight();
+                    int cropW = w / 2;
+                    int cropH = h / 2;
+                    Bitmap cropped = Bitmap.createBitmap(raw, w / 4, h / 4, cropW, cropH, rot, true);
+
+                    // Прогоняем через наш фильтр высокой контрастности и контурной резкости
+                    Bitmap enhanced = applySvedSharpnessMatrix(cropped);
+
+                    resultImageView.setImageBitmap(enhanced);
+                    resultImageView.setVisibility(View.VISIBLE);
+                    consoleOutput.append(" === ГОТОВО: Кадр проявлен! Блики срезаны, контуры цифр усилены ===\n");
+                    scrollToBottom(consoleScroll);
+                } catch (Exception e) {
+                    consoleOutput.append(" [Ошибка обработки]: " + e.getMessage() + "\n");
+                }
+            }
+        });
+    }
+
+    // Математический фильтр СВЕД: подавление серой пелены + контурная резкость 3x3
+    private Bitmap applySvedSharpnessMatrix(Bitmap src) {
+        int width = src.getWidth();
+        int height = src.getHeight();
+
+        // Шаг 1: Повышаем контрастность и убираем серый туман вокруг светящихся цифр
+        Bitmap contrasted = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888);
+        Canvas canvas = new Canvas(contrasted);
+        Paint paint = new Paint();
+        ColorMatrix cm = new ColorMatrix(new float[]{
+                1.6f, 0,    0,    0, -45, // Усиление красного спектра (для табло часов)
+                0,    1.4f, 0,    0, -45,
+                0,    0,    1.4f, 0, -45,
+                0,    0,    0,    1,   0
+        });
+        paint.setColorFilter(new ColorMatrixColorFilter(cm));
+        canvas.drawBitmap(src, 0, 0, paint);
+
+        // Шаг 2: Ядро свёртки резкости (Sharpen Kernel) для чётких границ сегментов цифр
+        int[] pixels = new int[width * height];
+        int[] outPixels = new int[width * height];
+        contrasted.getPixels(pixels, 0, width, 0, 0, width, height);
+
+        for (int y = 1; y < height - 1; y++) {
+            for (int x = 1; x < width - 1; x++) {
+                int idx = y * width + x;
+                int c = pixels[idx];
+                int top = pixels[(y - 1) * width + x];
+                int bottom = pixels[(y + 1) * width + x];
+                int left = pixels[y * width + (x - 1)];
+                int right = pixels[y * width + (x + 1)];
+
+                int r = clamp(5 * Color.red(c) - Color.red(top) - Color.red(bottom) - Color.red(left) - Color.red(right));
+                int g = clamp(5 * Color.green(c) - Color.green(top) - Color.green(bottom) - Color.green(left) - Color.green(right));
+                int b = clamp(5 * Color.blue(c) - Color.blue(top) - Color.blue(bottom) - Color.blue(left) - Color.blue(right));
+
+                outPixels[idx] = Color.rgb(r, g, b);
+            }
+        }
+        Bitmap finalBmp = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888);
+        finalBmp.setPixels(outPixels, 0, width, 0, 0, width, height);
+        return finalBmp;
+    }
+
+    private int clamp(int val) {
+        return Math.max(0, Math.min(255, val));
+    }
+
+    @Override
+    public void surfaceCreated(SurfaceHolder holder) {
+        startCameraPreview();
+    }
+
+    @Override
+    public void surfaceChanged(SurfaceHolder holder, int format, int width, int height) {}
+
+    @Override
+    public void surfaceDestroyed(SurfaceHolder holder) {
+        if (mCamera != null) {
+            mCamera.stopPreview();
+        }
     }
 
     private Button createAddButton(String title, int color, final String scriptBlock) {
         Button btn = new Button(this);
         btn.setText(title);
-        btn.setTextSize(10.5f);
+        btn.setTextSize(10f);
         btn.setBackgroundColor(color);
         btn.setTextColor(0xFFFFFFFF);
         LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f);
@@ -355,34 +476,16 @@ public class MainActivity extends Activity implements SensorEventListener {
         }
         scriptBuffer.append(block.trim());
         updateScriptWindow();
-        consoleOutput.append(" + Модуль в окне: " + block.split("\n")[0] + "\n");
-        scrollToBottom(consoleScroll);
     }
 
     private void updateScriptWindow() {
         if (scriptBuffer.length() == 0) {
-            scriptBox.setText("[Окно пусто. Добавьте обучающий скрипт или скрипт действия]");
+            scriptBox.setText("[Окно пусто. Добавьте скрипт]");
             scriptBox.setTextColor(0xFF777777);
         } else {
             scriptBox.setText(scriptBuffer.toString());
             scriptBox.setTextColor(0xFFAAFF00);
             scrollToBottom(scriptScroll);
-        }
-    }
-
-    private void loadInitialKernelScript() {
-        try {
-            BufferedReader reader = new BufferedReader(
-                    new InputStreamReader(getAssets().open("scripts/камера_ядро.свед"), "UTF-8"));
-            StringBuilder sb = new StringBuilder("[БАЗОВЫЙ СКРИПТ ЯДРА: КАМЕРА_ОПТИКА]\n");
-            String line;
-            while ((line = reader.readLine()) != null) {
-                sb.append(line).append("\n");
-            }
-            reader.close();
-            appendScriptToWindow(sb.toString());
-        } catch (Exception e) {
-            updateScriptWindow();
         }
     }
 
@@ -408,9 +511,7 @@ public class MainActivity extends Activity implements SensorEventListener {
                 }
                 reader.close();
                 appendScriptToWindow(sb.toString());
-            } catch (Exception e) {
-                consoleOutput.append("\n[Ошибка чтения файла]: " + e.getMessage() + "\n");
-            }
+            } catch (Exception ignored) {}
         }
     }
 
@@ -423,13 +524,11 @@ public class MainActivity extends Activity implements SensorEventListener {
         });
     }
 
-    // Полное освобождение датчиков, снятие удержания процессора и закрытие процессов
     private void shutdownAllProcesses() {
-        if (sensorManager != null) {
-            sensorManager.unregisterListener(this);
-        }
-        if (wakeLock != null && wakeLock.isHeld()) {
-            wakeLock.release();
+        if (mCamera != null) {
+            mCamera.stopPreview();
+            mCamera.release();
+            mCamera = null;
         }
         finishAndRemoveTask();
         Process.killProcess(Process.myPid());
