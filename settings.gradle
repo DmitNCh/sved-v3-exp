@@ -1,0 +1,2 @@
+rootProject.name = "SVED_V3_EXP"
+include ':app'
