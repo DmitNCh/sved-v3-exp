@@ -2,22 +2,32 @@ package ru.sved.core.v3;
 
 import android.Manifest;
 import android.app.Activity;
+import android.content.Context;
 import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.graphics.Bitmap;
-import android.graphics.BitmapFactory;
+import android.graphics.Canvas;
 import android.graphics.Color;
-import android.graphics.Matrix;
-import android.graphics.Rect;
-import android.hardware.Camera;
+import android.graphics.ColorMatrix;
+import android.graphics.ColorMatrixColorFilter;
+import android.graphics.Paint;
+import android.graphics.SurfaceTexture;
+import android.hardware.camera2.CameraAccessException;
+import android.hardware.camera2.CameraCaptureSession;
+import android.hardware.camera2.CameraCharacteristics;
+import android.hardware.camera2.CameraDevice;
+import android.hardware.camera2.CameraManager;
+import android.hardware.camera2.CaptureRequest;
+import android.hardware.camera2.params.StreamConfigurationMap;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Process;
+import android.util.Range;
+import android.util.Size;
 import android.view.Gravity;
-import android.view.MotionEvent;
-import android.view.SurfaceHolder;
-import android.view.SurfaceView;
+import android.view.Surface;
+import android.view.TextureView;
 import android.view.View;
 import android.widget.Button;
 import android.widget.FrameLayout;
@@ -29,12 +39,10 @@ import android.widget.TextView;
 import java.io.BufferedReader;
 import java.io.InputStream;
 import java.io.InputStreamReader;
-import java.util.ArrayList;
-import java.util.List;
+import java.util.Collections;
 
-// Терминал СВЕД v3.0: Прямой попиксельный захват 1:1 (без системного мыла зума) + Авто-Лупа на красное табло часов
-@SuppressWarnings("deprecation")
-public class MainActivity extends Activity implements SurfaceHolder.Callback {
+// Терминал СВЕД v3.0: Прямой аппаратный затвор Camera2 API (Сверхкороткая выдержка против выгорания цифр + Ручной фокус линзы)
+public class MainActivity extends Activity {
 
     private static final int PICK_SCRIPT_FILE = 101;
     private static final int REQ_CAMERA_PERM = 202;
@@ -46,13 +54,19 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private StringBuilder scriptBuffer = new StringBuilder();
 
     private LinearLayout cameraContainer;
-    private SurfaceView surfaceView;
-    private SurfaceHolder surfaceHolder;
+    private TextureView textureView;
     private ImageView resultImageView;
-    private Camera mCamera;
 
-    private int cropPowerPercent = 80; // Чистый попиксельный кроп СВЕД вместо мыльного зума
-    private int redCutoffThreshold = 65; // Порог отсечения ореола между цифрами
+    // Низкоуровневое управление матрицей Camera2
+    private CameraDevice cameraDevice;
+    private CameraCaptureSession captureSession;
+    private CaptureRequest.Builder previewBuilder;
+    private String cameraId;
+
+    // Параметры против выгорания светодиодных часов
+    private long shutterSpeedNs = 1500000L; // 1/660 секунды по умолчанию (срезает оранжевое пятно!)
+    private float focusDiopters = 0.0f;     // 0.0 = строгая бесконечность (дальняя стена цеха)
+    private int sniperZoomFactor = 7;       // 7-кратное увеличение центральной зоны
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -67,16 +81,16 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         consoleOutput = new TextView(this);
         consoleOutput.setTextColor(0xFF00FF00);
         consoleOutput.setTextSize(11f);
-        consoleOutput.setText("=== ТЕРМИНАЛ СВЕД v3.0 (ПРЯМАЯ МАТРИЦА 1:1) ===\n" +
-                "Системный мыльный зум ОТКЛЮЧЕН. Работает прямой съём пикселей + Авто-Лупа табло.\n");
+        consoleOutput.setText("=== ТЕРМИНАЛ СВЕД v3.0 (ПРЯМОЙ ЗАТВОР CAMERA2) ===\n" +
+                "Режим: Ручная сверхкороткая выдержка (против слияния цифр в пятно) + Ручной фокус.\n");
 
         consoleScroll = new ScrollView(this);
         consoleScroll.addView(consoleOutput);
         LinearLayout.LayoutParams consoleParams = new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, 0, 0.5f);
+                LinearLayout.LayoutParams.MATCH_PARENT, 0, 0.45f);
         layout.addView(consoleScroll, consoleParams);
 
-        // 2. ОПТИЧЕСКИЙ БЛОК
+        // 2. ОПТИЧЕСКИЙ БЛОК С ЖИВЫМ КОНТРОЛЕМ ВЫДЕРЖКИ И ЛИНЗЫ
         cameraContainer = new LinearLayout(this);
         cameraContainer.setOrientation(LinearLayout.VERTICAL);
         cameraContainer.setBackgroundColor(0xFF0A1520);
@@ -84,132 +98,109 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         cameraContainer.setVisibility(View.GONE);
 
         FrameLayout viewFinderFrame = new FrameLayout(this);
-        surfaceView = new SurfaceView(this);
-        surfaceHolder = surfaceView.getHolder();
-        surfaceHolder.addCallback(this);
+        textureView = new TextureView(this);
+        textureView.setSurfaceTextureListener(surfaceTextureListener);
+        viewFinderFrame.addView(textureView, new FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT, 440));
 
-        // Нажатие пальцем прямо по видоискателю заставляет линзу сфокусироваться в точку!
-        surfaceView.setOnTouchListener(new View.OnTouchListener() {
-            @Override
-            public boolean onTouch(View v, MotionEvent event) {
-                if (event.getAction() == MotionEvent.ACTION_DOWN) {
-                    triggerExactCenterFocus();
-                }
-                return true;
-            }
-        });
-
-        viewFinderFrame.addView(surfaceView, new FrameLayout.LayoutParams(
-                FrameLayout.LayoutParams.MATCH_PARENT, 450));
-
-        // Прицельная рамка
+        // Прицельный крест по центру
         TextView sniperCrosshair = new TextView(this);
-        sniperCrosshair.setText("[ + ДЕРЖИТЕ ЧАСЫ В ЦЕНТРЕ И НАЖМИТЕ СЮДА ДЛЯ ФОКУСА + ]");
+        sniperCrosshair.setText("[ + ДЕРЖИТЕ ЧАСЫ В ЦЕНТРЕ + ]");
         sniperCrosshair.setTextColor(0xFF00FF00);
-        sniperCrosshair.setTextSize(10f);
+        sniperCrosshair.setTextSize(11f);
         sniperCrosshair.setGravity(Gravity.CENTER);
         FrameLayout.LayoutParams crossParams = new FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT, Gravity.CENTER);
         viewFinderFrame.addView(sniperCrosshair, crossParams);
 
-        // Экран вывода проявленного табло
+        // Окно увеличенного кадра часов
         resultImageView = new ImageView(this);
         resultImageView.setScaleType(ImageView.ScaleType.FIT_CENTER);
         resultImageView.setBackgroundColor(0xFF000000);
         resultImageView.setVisibility(View.GONE);
         viewFinderFrame.addView(resultImageView, new FrameLayout.LayoutParams(
-                FrameLayout.LayoutParams.MATCH_PARENT, 450));
+                FrameLayout.LayoutParams.MATCH_PARENT, 440));
 
         cameraContainer.addView(viewFinderFrame);
 
-        // Ползунок 1: Масштаб вырезки табло (без потери резкости линзы)
-        TextView zoomLabel = new TextView(this);
-        zoomLabel.setText("1. УВЕЛИЧЕНИЕ ТАБЛО ЧАСОВ (Чистый кроп матрицы без мыла):");
-        zoomLabel.setTextColor(0xFF00FFFF);
-        zoomLabel.setTextSize(10f);
-        cameraContainer.addView(zoomLabel);
+        // Ползунок 1: СКОРОСТЬ ЗАТВОРА (убирает оранжевое пятно прямо вживую на экране!)
+        final TextView shutterLabel = new TextView(this);
+        shutterLabel.setText("1. СКОРОСТЬ ЗАТВОРА (двигайте вправо, пока пятно не распадётся на цифры):");
+        shutterLabel.setTextColor(0xFFFFAA00);
+        shutterLabel.setTextSize(10f);
+        cameraContainer.addView(shutterLabel);
 
-        SeekBar zoomBar = new SeekBar(this);
-        zoomBar.setMax(100);
-        zoomBar.setProgress(80);
-        zoomBar.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+        SeekBar shutterBar = new SeekBar(this);
+        shutterBar.setMax(100);
+        shutterBar.setProgress(75);
+        shutterBar.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
             @Override
             public void onProgressChanged(SeekBar seekBar, int progress, boolean fromUser) {
-                cropPowerPercent = Math.max(20, progress);
+                // От 1/60 сек (слева) до сверхкороткой 1/8000 сек (справа)
+                double ratio = (100 - progress) / 100.0;
+                shutterSpeedNs = (long) (125000L + (ratio * ratio * 16000000L));
+                int frac = (int) (1000000000L / Math.max(1, shutterSpeedNs));
+                shutterLabel.setText("1. ВЫДЕРЖКА ЗАТВОРА: 1/" + frac + " сек (меньше пятно -> чётче цифры)");
+                updateLiveCamera2Parameters();
             }
             @Override public void onStartTrackingTouch(SeekBar seekBar) {}
             @Override public void onStopTrackingTouch(SeekBar seekBar) {}
         });
-        cameraContainer.addView(zoomBar);
+        cameraContainer.addView(shutterBar);
 
-        // Ползунок 2: Разделение палочек цифр (порог отсечения красного ореола)
-        TextView expLabel = new TextView(this);
-        expLabel.setText("2. РАЗДЕЛЕНИЕ ПАЛОЧЕК ЦИФР (Срез красного пятна):");
-        expLabel.setTextColor(0xFFFFAA00);
-        expLabel.setTextSize(10f);
-        cameraContainer.addView(expLabel);
+        // Ползунок 2: РУЧНОЙ ФОКУС ЛИНЗЫ (чтобы часы и лампы никогда не расплывались в круги!)
+        final TextView focusLabel = new TextView(this);
+        focusLabel.setText("2. РУЧНОЙ ФОКУС ЛИНЗЫ (0.0 слева = строгая даль, круги сожмутся в точки):");
+        focusLabel.setTextColor(0xFF00FFFF);
+        focusLabel.setTextSize(10f);
+        cameraContainer.addView(focusLabel);
 
-        SeekBar expBar = new SeekBar(this);
-        expBar.setMax(100);
-        expBar.setProgress(65);
-        expBar.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+        SeekBar focusBar = new SeekBar(this);
+        focusBar.setMax(100);
+        focusBar.setProgress(5); // Почти на самом упоре бесконечности
+        focusBar.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
             @Override
             public void onProgressChanged(SeekBar seekBar, int progress, boolean fromUser) {
-                redCutoffThreshold = progress;
+                // От 0.0 диоптрий (бесконечность) до 3.0 диоптрий
+                focusDiopters = (progress / 100.0f) * 3.0f;
+                focusLabel.setText(String.format("2. РУЧНОЙ ФОКУС ЛИНЗЫ: %.2f диоптр. (ищите самые острые точки ламп)", focusDiopters));
+                updateLiveCamera2Parameters();
             }
             @Override public void onStartTrackingTouch(SeekBar seekBar) {}
             @Override public void onStopTrackingTouch(SeekBar seekBar) {}
         });
-        cameraContainer.addView(expBar);
+        cameraContainer.addView(focusBar);
 
-        // Кнопки управления оптикой
+        // Кнопки захвата и возврата к прицелу
         LinearLayout camBtnRow = new LinearLayout(this);
         camBtnRow.setOrientation(LinearLayout.HORIZONTAL);
 
-        Button focusBtn = new Button(this);
-        focusBtn.setText("1. НАВЕСТИ РЕЗКОСТЬ");
-        focusBtn.setTextSize(9.5f);
-        focusBtn.setBackgroundColor(0xFF554400);
-        focusBtn.setTextColor(0xFFFFFFFF);
-        LinearLayout.LayoutParams focP = new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 0.85f);
-        focP.setMargins(2, 4, 2, 2);
-        focusBtn.setOnClickListener(new View.OnClickListener() {
-            @Override
-            public void onClick(View v) {
-                triggerExactCenterFocus();
-            }
-        });
-        camBtnRow.addView(focusBtn, focP);
-
         Button snapBtn = new Button(this);
-        snapBtn.setText("2. ВЫДЕЛИТЬ ЧАСЫ");
-        snapBtn.setTextSize(9.5f);
+        snapBtn.setText("ЗАХВАТИТЬ И УВЕЛИЧИТЬ ЦЕНТР (8X)");
+        snapBtn.setTextSize(10f);
         snapBtn.setBackgroundColor(0xFF007744);
         snapBtn.setTextColor(0xFFFFFFFF);
-        LinearLayout.LayoutParams snapP = new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 0.95f);
+        LinearLayout.LayoutParams snapP = new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1.35f);
         snapP.setMargins(2, 4, 2, 2);
         snapBtn.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
-                takePureMatrixPicture();
+                captureSniperTextureCrop();
             }
         });
         camBtnRow.addView(snapBtn, snapP);
 
         Button liveBtn = new Button(this);
-        liveBtn.setText("СБРОС");
-        liveBtn.setTextSize(9.5f);
+        liveBtn.setText("ЖИВОЙ ПРИЦЕЛ");
+        liveBtn.setTextSize(10f);
         liveBtn.setBackgroundColor(0xFF224466);
         liveBtn.setTextColor(0xFFFFFFFF);
-        LinearLayout.LayoutParams liveP = new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 0.5f);
+        LinearLayout.LayoutParams liveP = new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 0.65f);
         liveP.setMargins(2, 4, 2, 2);
         liveBtn.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
                 resultImageView.setVisibility(View.GONE);
-                if (mCamera != null) {
-                    mCamera.startPreview();
-                }
             }
         });
         camBtnRow.addView(liveBtn, liveP);
@@ -226,7 +217,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
         scriptBox = new TextView(this);
         scriptBox.setTextColor(0xFFAAFF00);
-        scriptBox.setTextSize(11.5f);
+        scriptBox.setTextSize(11f);
         scriptBox.setPadding(10, 10, 10, 10);
         scriptBox.setFocusable(false);
         scriptBox.setClickable(false);
@@ -235,21 +226,21 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         scriptScroll.setBackgroundColor(0xFF121820);
         scriptScroll.addView(scriptBox);
         LinearLayout.LayoutParams boxParams = new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, 0, 0.6f);
+                LinearLayout.LayoutParams.MATCH_PARENT, 0, 0.55f);
         boxParams.setMargins(0, 2, 0, 4);
         layout.addView(scriptScroll, boxParams);
 
         // 4. КНОПКИ ДОБАВЛЕНИЯ СКРИПТОВ
         LinearLayout trainRow = new LinearLayout(this);
         trainRow.setOrientation(LinearLayout.HORIZONTAL);
-        trainRow.addView(createAddButton("+ ОБУЧЕНИЕ: БЕЗ МЫЛА ЗУМА", 0xFF1F3A52,
-                "[ОБУЧАЮЩИЙ СКРИПТ: ОТКЛЮЧЕНИЕ_МЫЛЬНОГО_ЗУМА]\n" +
-                "ОБУЧЕНИЕ: СЪЕМ ПИКСЕЛЕЙ 1:1 БЕЗ ИНТЕРПОЛЯЦИИ\n" +
-                "ОБУЧЕНИЕ: АВТОПОИСК КРАСНОГО ТАБЛО ЧАСОВ"));
-        trainRow.addView(createAddButton("+ ДЕЙСТВИЕ: МАКРО-ЛУПА ЧАСОВ", 0xFF1A4731,
-                "[СКРИПТ ДЕЙСТВИЯ: ПРОЯВКА_СЕГМЕНТОВ]\n" +
-                "ДЕЙСТВИЕ: ТОЧЕЧНЫЙ ФОКУС ПО ЦЕНТРУ ЛИНЗЫ\n" +
-                "ДЕЙСТВИЕ: ВЫРЕЗКА ТАБЛО И РАЗДЕЛЕНИЕ ЦИФР"));
+        trainRow.addView(createAddButton("+ ОБУЧЕНИЕ: ЗАТВОР 1/2000", 0xFF1F3A52,
+                "[ОБУЧАЮЩИЙ СКРИПТ: ЗАТВОР_ПРОТИВ_ПЯТНА]\n" +
+                "ОБУЧЕНИЕ: ОТКЛЮЧЕНИЕ АВТОЭКСПОЗИЦИИ ANDROID\n" +
+                "ОБУЧЕНИЕ: ВЫДЕРЖКА 1/2000 СЕК + ISO 100"));
+        trainRow.addView(createAddButton("+ ДЕЙСТВИЕ: РУЧНАЯ ЛИНЗА", 0xFF1A4731,
+                "[СКРИПТ ДЕЙСТВИЯ: ЖЕСТКИЙ_ФОКУС_ДАЛЬ]\n" +
+                "ДЕЙСТВИЕ: БЛОКИРОВКА АВТОФОКУСА НА 0.0 ДИОПТРИЙ\n" +
+                "ДЕЙСТВИЕ: КОНТУРНАЯ ПРОЯВКА СЕГМЕНТОВ"));
         layout.addView(trainRow);
 
         // 5. ФАЙЛ / ОЧИСТКА
@@ -299,7 +290,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         runBtn.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
-                executeOpticalScripts();
+                executeCamera2Scripts();
             }
         });
         layout.addView(runBtn, runParams);
@@ -318,16 +309,16 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         layout.addView(killBtn);
 
         setContentView(layout);
-        appendScriptToWindow("[СКРИПТ ОПТИКИ: ЧИСТАЯ_МАТРИЦА_БЕЗ_МЫЛА]\n" +
-                "ОБУЧЕНИЕ: СЪЕМ ПИКСЕЛЕЙ 1:1 БЕЗ СИСТЕМНОГО ЗУМА\n" +
-                "ДЕЙСТВИЕ: ТОЧЕЧНЫЙ ФОКУС НА ДАЛЬНИЕ ЛАМПЫ/ЧАСЫ\n" +
-                "ДЕЙСТВИЕ: АВТО-ЛУПА НА КРАСНОЕ ТАБЛО ЧАСОВ");
+        appendScriptToWindow("[СКРИПТ ОПТИКИ: РУЧНОЙ_ЗАТВОР_CAMERA2]\n" +
+                "ОБУЧЕНИЕ: СВЕРХКОРОТКАЯ ВЫДЕРЖКА ПРОТИВ ВЫГОРАНИЯ ЦИФР\n" +
+                "ДЕЙСТВИЕ: РУЧНАЯ ФИКСАЦИЯ ЛИНЗЫ НА БЕСКОНЕЧНОСТЬ (0.0)\n" +
+                "ДЕЙСТВИЕ: КОНТУРНАЯ ПРОЯВКА СВЕТОДИОДОВ");
     }
 
-    private void executeOpticalScripts() {
-        consoleOutput.append("\n=== ВКЛЮЧЕН ПРЯМОЙ СЪЕМ МАТРИЦЫ 1:1 ===\n");
-        consoleOutput.append(" -> Шаг 1: Наведите центр на часы и нажмите ЖЕЛТУЮ кнопку '1. НАВЕСТИ РЕЗКОСТЬ' (чтобы лампы стали маленькими точками).\n");
-        consoleOutput.append(" -> Шаг 2: Нажмите ЗЕЛЕНУЮ кнопку '2. ВЫДЕЛИТЬ ЧАСЫ'.\n");
+    private void executeCamera2Scripts() {
+        consoleOutput.append("\n=== ЗАПУСК РУЧНОГО ЗАТВОРА CAMERA2 API ===\n");
+        consoleOutput.append(" -> Ползунок 1 регулирует скорость затвора (убирает оранжевый пересвет).\n");
+        consoleOutput.append(" -> Ползунок 2 жёстко держит линзу на бесконечности (никаких пушистых кругов!).\n");
         scrollToBottom(consoleScroll);
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
@@ -336,234 +327,201 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                 return;
             }
         }
-        openSvedCamera();
-    }
-
-    @Override
-    public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
-        if (requestCode == REQ_CAMERA_PERM && grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
-            openSvedCamera();
-        }
-    }
-
-    private void openSvedCamera() {
         cameraContainer.setVisibility(View.VISIBLE);
         resultImageView.setVisibility(View.GONE);
-        startCameraPreview();
+        if (textureView.isAvailable()) {
+            openCamera2Hardware();
+        }
     }
 
-    private void startCameraPreview() {
+    private final TextureView.SurfaceTextureListener surfaceTextureListener = new TextureView.SurfaceTextureListener() {
+        @Override
+        public void onSurfaceTextureAvailable(SurfaceTexture surface, int width, int height) {
+            openCamera2Hardware();
+        }
+        @Override public void onSurfaceTextureSizeChanged(SurfaceTexture surface, int width, int height) {}
+        @Override public boolean onSurfaceTextureDestroyed(SurfaceTexture surface) { return false; }
+        @Override public void onSurfaceTextureUpdated(SurfaceTexture surface) {}
+    };
+
+    private void openCamera2Hardware() {
         try {
-            if (mCamera == null) {
-                mCamera = Camera.open(0);
-                mCamera.setDisplayOrientation(90);
+            CameraManager manager = (CameraManager) getSystemService(Context.CAMERA_SERVICE);
+            if (manager == null) return;
+            cameraId = manager.getCameraIdList()[0];
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M &&
+                    checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
+                return;
             }
-            mCamera.setPreviewDisplay(surfaceHolder);
-            mCamera.startPreview();
-            setupPureSensorParameters();
-        } catch (Exception ignored) {}
+
+            manager.openCamera(cameraId, new CameraDevice.StateCallback() {
+                @Override
+                public void onOpened(CameraDevice camera) {
+                    cameraDevice = camera;
+                    startCamera2PreviewSession();
+                }
+                @Override
+                public void onDisconnected(CameraDevice camera) {
+                    camera.close();
+                    cameraDevice = null;
+                }
+                @Override
+                public void onError(CameraDevice camera, int error) {
+                    camera.close();
+                    cameraDevice = null;
+                }
+            }, null);
+        } catch (Exception e) {
+            consoleOutput.append(" [Ошибка Camera2]: " + e.getMessage() + "\n");
+        }
     }
 
-    // Главное отличие: умеренный оптический зум (только 30%, где нет мыла и работает точный фокус!) + максимум мегапикселей
-    private void setupPureSensorParameters() {
-        if (mCamera == null) return;
+    private void startCamera2PreviewSession() {
         try {
-            Camera.Parameters params = mCamera.getParameters();
+            if (cameraDevice == null || !textureView.isAvailable()) return;
+            SurfaceTexture texture = textureView.getSurfaceTexture();
+            CameraManager manager = (CameraManager) getSystemService(Context.CAMERA_SERVICE);
+            CameraCharacteristics chars = manager.getCameraCharacteristics(cameraId);
+            StreamConfigurationMap map = chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP);
 
-            // 1. Максимальное разрешение матрицы
-            List<Camera.Size> sizes = params.getSupportedPictureSizes();
-            if (sizes != null && !sizes.isEmpty()) {
-                Camera.Size best = sizes.get(0);
-                for (Camera.Size s : sizes) {
-                    if ((s.width * s.height) > (best.width * best.height)) {
-                        best = s;
+            // Выбираем самое чёткое разрешение видоискателя (1920x1080 или выше)
+            Size bestSize = new Size(1920, 1080);
+            if (map != null) {
+                Size[] sizes = map.getOutputSizes(SurfaceTexture.class);
+                if (sizes != null && sizes.length > 0) {
+                    bestSize = sizes[0];
+                    for (Size s : sizes) {
+                        if (s.getWidth() * s.getHeight() > bestSize.getWidth() * bestSize.getHeight()
+                                && s.getWidth() <= 3840) {
+                            bestSize = s;
+                        }
                     }
                 }
-                params.setPictureSize(best.width, best.height);
             }
-            params.setJpegQuality(100);
+            texture.setDefaultBufferSize(bestSize.getWidth(), bestSize.getHeight());
+            Surface surface = new Surface(texture);
 
-            // 2. Ставим зум только на 25% от максимума — это даёт крупный план в прицеле, но НЕ включает мыльную интерполяцию и НЕ сбивает линзу!
-            if (params.isZoomSupported()) {
-                params.setZoom(params.getMaxZoom() / 4);
-            }
+            previewBuilder = cameraDevice.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW);
+            previewBuilder.addTarget(surface);
 
-            // 3. Умеренное притемнение (-60% от минимума), чтобы часы не перегорали, но сохраняли чёткие палочки
-            int minExp = params.getMinExposureCompensation();
-            if (minExp < 0) {
-                params.setExposureCompensation((minExp * 60) / 100);
-            }
-
-            // 4. Задаём центральную снайперскую зону фокусировки (100x100 в самом центре кадра)
-            if (params.getMaxNumFocusAreas() > 0) {
-                List<Camera.Area> focusAreas = new ArrayList<>();
-                focusAreas.add(new Camera.Area(new Rect(-150, -150, 150, 150), 1000));
-                params.setFocusAreas(focusAreas);
-            }
-            if (params.getMaxNumMeteringAreas() > 0) {
-                List<Camera.Area> meterAreas = new ArrayList<>();
-                meterAreas.add(new Camera.Area(new Rect(-150, -150, 150, 150), 1000));
-                params.setMeteringAreas(meterAreas);
-            }
-
-            List<String> focusModes = params.getSupportedFocusModes();
-            if (focusModes != null && focusModes.contains(Camera.Parameters.FOCUS_MODE_AUTO)) {
-                params.setFocusMode(Camera.Parameters.FOCUS_MODE_AUTO);
-            }
-
-            mCamera.setParameters(params);
+            cameraDevice.createCaptureSession(Collections.singletonList(surface),
+                    new CameraCaptureSession.StateCallback() {
+                        @Override
+                        public void onConfigured(CameraCaptureSession session) {
+                            captureSession = session;
+                            updateLiveCamera2Parameters();
+                        }
+                        @Override
+                        public void onConfigureFailed(CameraCaptureSession session) {}
+                    }, null);
         } catch (Exception ignored) {}
     }
 
-    // Принудительная точечная фокусировка линзы по центру (убирает круги боке на лампах!)
-    private void triggerExactCenterFocus() {
-        if (mCamera == null) return;
-        consoleOutput.append(" -> Наводка резкости линзы точно по центру...\n");
-        scrollToBottom(consoleScroll);
+    // Прямая подача короткой выдержки, минимального ISO и ручного фокуса линзы в железо смартфона
+    private void updateLiveCamera2Parameters() {
+        if (cameraDevice == null || captureSession == null || previewBuilder == null) return;
         try {
-            mCamera.cancelAutoFocus();
-            setupPureSensorParameters();
-            mCamera.autoFocus(new Camera.AutoFocusCallback() {
-                @Override
-                public void onAutoFocus(boolean success, Camera camera) {
-                    consoleOutput.append(" -> Резкость зафиксирована! Теперь жмите '2. ВЫДЕЛИТЬ ЧАСЫ'.\n");
-                    scrollToBottom(consoleScroll);
-                }
-            });
-        } catch (Exception ignored) {}
-    }
+            CameraManager manager = (CameraManager) getSystemService(Context.CAMERA_SERVICE);
+            CameraCharacteristics chars = manager.getCameraCharacteristics(cameraId);
 
-    // Захват чистого кадра матрицы и автоматический поиск красного табло часов в центральной зоне
-    private void takePureMatrixPicture() {
-        if (mCamera == null) return;
-        consoleOutput.append(" -> Съём полных мегапикселей матрицы и поиск табло часов...\n");
-        scrollToBottom(consoleScroll);
+            // 1. Отключаем автофокус, который делал пушистые круги, и жёстко фиксируем линзу на дальность!
+            previewBuilder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_OFF);
+            previewBuilder.set(CaptureRequest.LENS_FOCUS_DISTANCE, focusDiopters);
 
-        mCamera.takePicture(null, null, new Camera.PictureCallback() {
-            @Override
-            public void onPictureTaken(byte[] data, Camera camera) {
-                try {
-                    Bitmap raw = BitmapFactory.decodeByteArray(data, 0, data.length);
-                    Matrix rot = new Matrix();
-                    rot.postRotate(90);
+            // 2. Пробуем включить полностью ручной затвор (CONTROL_AE_MODE_OFF) со сверхкороткой выдержкой и ISO 100
+            Range<Long> expRange = chars.get(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE);
+            Range<Integer> isoRange = chars.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE);
 
-                    // Вырезаем центральную зону из полного кадра
-                    int w = raw.getWidth();
-                    int h = raw.getHeight();
-                    int divisor = 2 + (cropPowerPercent / 20); // от 3x до 7x чистых пикселей
-                    int cropW = w / divisor;
-                    int cropH = h / divisor;
-                    int startX = (w - cropW) / 2;
-                    int startY = (h - cropH) / 2;
-
-                    Bitmap centerZone = Bitmap.createBitmap(raw, startX, startY, cropW, cropH, rot, true);
-
-                    // Автоматически находим красное табло часов внутри центральной зоны и делаем Макро-Вырезку!
-                    Bitmap clockMacro = autoLocateAndEnhanceRedClock(centerZone);
-
-                    resultImageView.setImageBitmap(clockMacro);
-                    resultImageView.setVisibility(View.VISIBLE);
-                    consoleOutput.append(" === ГОТОВО: Табло часов найдено и выведено крупным планом! ===\n");
-                    scrollToBottom(consoleScroll);
-                } catch (Exception e) {
-                    consoleOutput.append(" [Ошибка]: " + e.getMessage() + "\n");
-                }
-            }
-        });
-    }
-
-    // Алгоритм СВЕД: находит скопление красных пикселей часов, вырезает именно табло и разделяет палочки цифр
-    private Bitmap autoLocateAndEnhanceRedClock(Bitmap src) {
-        int w = src.getWidth();
-        int h = src.getHeight();
-        int[] pixels = new int[w * h];
-        src.getPixels(pixels, 0, w, 0, 0, w, h);
-
-        // 1. Ищем центр тяжести красного свечения часов (чтобы приблизить именно само табло!)
-        long sumX = 0, sumY = 0, count = 0;
-        int maxRedFound = 0;
-
-        for (int y = h / 6; y < (h * 5) / 6; y++) {
-            for (int x = w / 6; x < (w * 5) / 6; x++) {
-                int c = pixels[y * w + x];
-                int r = Color.red(c);
-                int g = Color.green(c);
-                int b = Color.blue(c);
-                // Признак светящегося красного табло: красный доминирует над зелёным и синим
-                if (r > 70 && r > (g * 1.6f) && r > (b * 1.6f)) {
-                    sumX += x;
-                    sumY += y;
-                    count++;
-                    if (r > maxRedFound) maxRedFound = r;
-                }
-            }
-        }
-
-        Bitmap targetCrop = src;
-        // Если нашли красное табло часов — вырезаем прицельное окно прямо вокруг него!
-        if (count > 10) {
-            int centerX = (int) (sumX / count);
-            int centerY = (int) (sumY / count);
-            int boxW = Math.max(160, w / 3);
-            int boxH = Math.max(120, h / 4);
-            int left = Math.max(0, Math.min(w - boxW, centerX - boxW / 2));
-            int top = Math.max(0, Math.min(h - boxH, centerY - boxH / 2));
-            targetCrop = Bitmap.createBitmap(src, left, top, boxW, boxH);
-        }
-
-        // 2. Адаптивное разделение сегментов цифр внутри найденного табло
-        int tw = targetCrop.getWidth();
-        int th = targetCrop.getHeight();
-        int[] tPixels = new int[tw * th];
-        int[] outPixels = new int[tw * th];
-        targetCrop.getPixels(tPixels, 0, tw, 0, 0, tw, th);
-
-        // Вычисляем порог между яркими палочками цифр и тусклым ореолом между ними
-        int cutoff = (maxRedFound > 90) ? (int) (maxRedFound * (0.35f + (redCutoffThreshold / 220.0f))) : 80;
-
-        for (int i = 0; i < tPixels.length; i++) {
-            int c = tPixels[i];
-            int r = Color.red(c);
-            int g = Color.green(c);
-            int b = Color.blue(c);
-
-            int redness = r - Math.max(g, b);
-            if (redness > 25 && r >= cutoff) {
-                // Это сама светящаяся палочка цифры — делаем её максимально чёткой и яркой (янтарно-красной)
-                int boost = clamp((r - cutoff) * 4 + 120);
-                outPixels[i] = Color.rgb(boost, boost / 3, 0);
-            } else if (redness > 15 && r < cutoff) {
-                // Это паразитный красный ореол между палочками цифр — гасим его в глубокий чёрный!
-                outPixels[i] = Color.rgb(10, 0, 0);
+            if (expRange != null && isoRange != null) {
+                previewBuilder.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_OFF);
+                long clampedExp = Math.max(expRange.getLower(), Math.min(expRange.getUpper(), shutterSpeedNs));
+                int minIso = Math.max(50, isoRange.getLower());
+                previewBuilder.set(CaptureRequest.SENSOR_EXPOSURE_TIME, clampedExp);
+                previewBuilder.set(CaptureRequest.SENSOR_SENSITIVITY, minIso);
             } else {
-                // Контуры корпуса часов и стены вокруг
-                int luma = (r + g + b) / 3;
-                outPixels[i] = Color.rgb(luma, luma, luma);
+                // Если телефон блокирует ручной затвор, ставим максимальное притемнение AE
+                previewBuilder.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON);
+                Range<Integer> compRange = chars.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_RANGE);
+                if (compRange != null) {
+                    previewBuilder.set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, compRange.getLower());
+                }
+            }
+
+            // 3. Включаем максимальную аппаратную контурную резкость процессора камеры
+            previewBuilder.set(CaptureRequest.EDGE_MODE, CaptureRequest.EDGE_MODE_HIGH_QUALITY);
+
+            captureSession.setRepeatingRequest(previewBuilder.build(), null, null);
+        } catch (CameraAccessException ignored) {}
+    }
+
+    // Захват идеально сфокусированного центра прямо с матричной текстуры (8x увеличение без потери резкости)
+    private void captureSniperTextureCrop() {
+        Bitmap fullFrame = textureView.getBitmap();
+        if (fullFrame == null) return;
+
+        int w = fullFrame.getWidth();
+        int h = fullFrame.getHeight();
+        int cropW = w / sniperZoomFactor;
+        int cropH = h / sniperZoomFactor;
+        int startX = (w - cropW) / 2;
+        int startY = (h - cropH) / 2;
+
+        Bitmap centerCrop = Bitmap.createBitmap(fullFrame, startX, startY, cropW, cropH);
+        Bitmap sharpened = sharpenClockSegments(centerCrop);
+
+        resultImageView.setImageBitmap(sharpened);
+        resultImageView.setVisibility(View.VISIBLE);
+        consoleOutput.append(" === ГОТОВО: Захвачен центр при выдержке 1/" +
+                (1000000000L / Math.max(1, shutterSpeedNs)) + " сек и фокусе " +
+                String.format("%.2f", focusDiopters) + " ===\n");
+        scrollToBottom(consoleScroll);
+    }
+
+    // Мягкое усиление чёткости границ цифр без заливки их в сплошное пятно
+    private Bitmap sharpenClockSegments(Bitmap src) {
+        int width = src.getWidth();
+        int height = src.getHeight();
+
+        Bitmap contrasted = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888);
+        Canvas canvas = new Canvas(contrasted);
+        Paint paint = new Paint();
+        ColorMatrix cm = new ColorMatrix(new float[]{
+                1.35f, 0,     0,     0, -25,
+                0,     1.35f, 0,     0, -25,
+                0,     0,     1.35f, 0, -25,
+                0,     0,     0,     1,   0
+        });
+        paint.setColorFilter(new ColorMatrixColorFilter(cm));
+        canvas.drawBitmap(src, 0, 0, paint);
+
+        int[] pixels = new int[width * height];
+        int[] outPixels = new int[width * height];
+        contrasted.getPixels(pixels, 0, width, 0, 0, width, height);
+
+        for (int y = 1; y < height - 1; y++) {
+            for (int x = 1; x < width - 1; x++) {
+                int idx = y * width + x;
+                int c = pixels[idx];
+                int top = pixels[(y - 1) * width + x];
+                int bottom = pixels[(y + 1) * width + x];
+                int left = pixels[y * width + (x - 1)];
+                int right = pixels[y * width + (x + 1)];
+
+                int r = clamp(5 * Color.red(c) - Color.red(top) - Color.red(bottom) - Color.red(left) - Color.red(right));
+                int g = clamp(5 * Color.green(c) - Color.green(top) - Color.green(bottom) - Color.green(left) - Color.green(right));
+                int b = clamp(5 * Color.blue(c) - Color.blue(top) - Color.blue(bottom) - Color.blue(left) - Color.blue(right));
+
+                outPixels[idx] = Color.rgb(r, g, b);
             }
         }
-
-        Bitmap finalBmp = Bitmap.createBitmap(tw, th, Bitmap.Config.ARGB_8888);
-        finalBmp.setPixels(outPixels, 0, tw, 0, 0, tw, th);
+        Bitmap finalBmp = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888);
+        finalBmp.setPixels(outPixels, 0, width, 0, 0, width, height);
         return finalBmp;
     }
 
     private int clamp(int val) {
         return Math.max(0, Math.min(255, val));
-    }
-
-    @Override
-    public void surfaceCreated(SurfaceHolder holder) {
-        startCameraPreview();
-    }
-
-    @Override
-    public void surfaceChanged(SurfaceHolder holder, int format, int width, int height) {}
-
-    @Override
-    public void surfaceDestroyed(SurfaceHolder holder) {
-        if (mCamera != null) {
-            mCamera.stopPreview();
-        }
     }
 
     private Button createAddButton(String title, int color, final String scriptBlock) {
@@ -639,10 +597,13 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     }
 
     private void shutdownAllProcesses() {
-        if (mCamera != null) {
-            mCamera.stopPreview();
-            mCamera.release();
-            mCamera = null;
+        if (captureSession != null) {
+            captureSession.close();
+            captureSession = null;
+        }
+        if (cameraDevice != null) {
+            cameraDevice.close();
+            cameraDevice = null;
         }
         finishAndRemoveTask();
         Process.killProcess(Process.myPid());
